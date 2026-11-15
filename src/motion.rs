@@ -227,6 +227,8 @@ struct Mp4Track {
     default_duration: u32,
     /// The presentation time of the first sample, in timescale units.
     start: i64,
+    /// How the clip's numbers turn into colours, as its stream's header says.
+    colors: crate::video::Colors,
 }
 
 fn parse_track(moov: &[u8]) -> Option<Mp4Track> {
@@ -236,6 +238,8 @@ fn parse_track(moov: &[u8]) -> Option<Mp4Track> {
     let at = stsd.windows(4).position(|w| w == b"avcC")? + 4;
     let c = stsd.get(at..)?;
     let nal_len = (*c.get(4)? & 3) as usize + 1;
+    // The first SPS's: the one a stream starts with.
+    let colors = c.get(6..8).and_then(|n| c.get(8..8 + u16::from_be_bytes([n[0], n[1]]) as usize)).and_then(crate::video::sps_colors).unwrap_or_default();
     let mut params = Vec::new();
     let mut o = 6;
     let mut copy = |count: usize, o: &mut usize| -> Option<()> {
@@ -254,7 +258,7 @@ fn parse_track(moov: &[u8]) -> Option<Mp4Track> {
     let default_duration = find(moov, &["mvex", "trex"]).and_then(|t| be32(t, 12)).unwrap_or(0);
     // With B-frames the first frame shows late; the edit list takes that back out.
     let start = find(moov, &["trak", "edts", "elst"]).and_then(|e| if e[0] == 1 { be64(e, 16).map(|v| v as i64) } else { be32(e, 12).map(|v| v as i32 as i64) }).filter(|v| *v > 0).unwrap_or(0);
-    Some(Mp4Track { params, nal_len, timescale, default_duration, start })
+    Some(Mp4Track { params, nal_len, timescale, default_duration, start, colors })
 }
 
 /// A frame's bytes in the fragment, and when it shows.
@@ -377,9 +381,10 @@ fn new_decoder(track: &Mp4Track) -> anyhow::Result<Decoder> {
 /// `yuv` at 1/`step` of its size, as RGBA the texture takes. Smaller in the conversion
 /// itself: it costs as much as decoding at full size, and the sleeve shows no more than
 /// its own size. Each pixel's light is the average of the 2×2 it starts.
-fn scaled_rgba(yuv: &openh264::decoder::DecodedYUV, step: usize) -> (usize, usize, Vec<u8>) {
+fn scaled_rgba(yuv: &openh264::decoder::DecodedYUV, step: usize, colors: crate::video::Colors) -> (usize, usize, Vec<u8>) {
     let (w, h) = yuv.dimensions();
     let step = step.max(1);
+    let m = colors.to_rgb();
     let (ow, oh) = (w / step, h / step);
     let (ys, us, vs) = yuv.strides();
     let (y, u, v) = (yuv.y(), yuv.u(), yuv.v());
@@ -391,10 +396,8 @@ fn scaled_rgba(yuv: &openh264::decoder::DecodedYUV, step: usize) -> (usize, usiz
         for ox in 0..ow {
             let sx = ox * step;
             let l = if step > 1 { (row[sx] as i32 + row[sx + 1] as i32 + below[sx] as i32 + below[sx + 1] as i32 + 2) >> 2 } else { row[sx] as i32 };
-            let (cu, cv) = (ur[sx / 2] as i32 - 128, vr[sx / 2] as i32 - 128);
-            // The BT.601 weights write_rgba8 uses, in 1024ths.
-            let c = |x: i32| x.clamp(0, 255) as u8;
-            rgba.extend_from_slice(&[c(l + ((1436 * cv) >> 10)), c(l - ((352 * cu + 731 * cv) >> 10)), c(l + ((1815 * cu) >> 10)), 255]);
+            let p = m.rgb(l, ur[sx / 2], vr[sx / 2]);
+            rgba.extend_from_slice(&[p.r(), p.g(), p.b(), 255]);
         }
     }
     (ow, oh, rgba)
@@ -421,7 +424,11 @@ fn decode(motion: &Arc<Motion>, path: &std::path::Path, ctx: &egui::Context, max
         log::info!("animated cover: no frames in the clip");
         return;
     }
-    log::info!("animated cover: clip has {} frame(s)", samples.len());
+    // Every frame at its own pace, from the first frame's time: some clips showed only
+    // about half their frames and played the rest too fast, so the picture cut and jumped.
+    let (times, length) = loop_times(&samples.iter().map(|s| s.1).collect::<Vec<_>>());
+    let samples: Vec<(Vec<u8>, f64)> = samples.into_iter().zip(times).map(|((data, _), t)| (data, t)).collect();
+    log::info!("animated cover: {} frames, {length:.1} s", samples.len());
     let side = max_width.max(64);
     let mut last = Instant::now();
     'laps: for _lap in 0u64.. {
@@ -444,7 +451,7 @@ fn decode(motion: &Arc<Motion>, path: &std::path::Path, ctx: &egui::Context, max
             if !wait_for(&motion.playing, &motion.stop, &mut clock, &mut last, due) {
                 break 'laps;
             }
-            let (w, h, rgba) = scaled_rgba(&yuv, (yuv.dimensions().0 / side as usize).max(1));
+            let (w, h, rgba) = scaled_rgba(&yuv, (yuv.dimensions().0 / side as usize).max(1), track.colors);
             if motion.version.load(Ordering::Acquire) == 0 {
                 log::info!("animated cover: playing at {w}x{h}");
             }
@@ -456,10 +463,34 @@ fn decode(motion: &Arc<Motion>, path: &std::path::Path, ctx: &egui::Context, max
             if !wait_for(&motion.playing, &motion.stop, &mut clock, &mut last, due) {
                 break 'laps;
             }
-            let (w, h, rgba) = scaled_rgba(yuv, (yuv.dimensions().0 / side as usize).max(1));
+            let (w, h, rgba) = scaled_rgba(yuv, (yuv.dimensions().0 / side as usize).max(1), track.colors);
             motion.publish(ctx, w, h, rgba);
         }
+        // The lap's length: the last frame gets its step before the clip starts over.
+        if !wait_for(&motion.playing, &motion.stop, &mut clock, &mut last, length) {
+            break 'laps;
+        }
     }
+}
+
+/// A clip's frame times from its first frame, and how long one lap lasts: up to the last
+/// frame's end, a frame's usual step after it.
+fn loop_times(pts: &[f64]) -> (Vec<f64>, f64) {
+    let mut sorted = pts.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let (Some(first), Some(last)) = (sorted.first().copied(), sorted.last().copied()) else { return (Vec::new(), 0.0) };
+    // The step most frames are apart, counted by whole milliseconds and averaged.
+    let mut counts: std::collections::HashMap<i64, (usize, f64)> = std::collections::HashMap::new();
+    for w in sorted.windows(2) {
+        let d = w[1] - w[0];
+        let ms = (d * 1000.0).round() as i64;
+        if ms > 0 {
+            let c = counts.entry(ms).or_default();
+            *c = (c.0 + 1, c.1 + d);
+        }
+    }
+    let step = counts.into_values().max_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1))).map_or(1.0 / 30.0, |(n, sum)| sum / n as f64);
+    (pts.iter().map(|p| p - first).collect(), last - first + step)
 }
 
 /// Wait until the clip's clock reaches `due`. The clock only advances while the music
@@ -513,6 +544,19 @@ mod tests {
     }
 
     #[test]
+    fn a_clip_keeps_its_own_times_and_loops_after_its_last_frame() {
+        // Decode order, B-frames shown out of it, starting late as Apple's do.
+        let frame = 1.0 / 30.0;
+        let pts = [10.0, 13.0, 11.0, 12.0].map(|n| n * frame);
+        let (times, length) = loop_times(&pts);
+        for (t, w) in times.iter().zip([0.0, 3.0, 1.0, 2.0].map(|n| n * frame)) {
+            assert!((t - w).abs() < 1e-9, "{times:?}");
+        }
+        assert!((length - 4.0 * frame).abs() < 1e-9);
+        assert_eq!(loop_times(&[]).0, Vec::<f64>::new());
+    }
+
+    #[test]
     fn every_run_of_a_fragment_is_read() {
         // Two runs in one track fragment, as in Apple's clips: the second has no data
         // offset of its own and carries on in time and in the file from the first.
@@ -522,7 +566,7 @@ mod tests {
         let second = boxed(b"trun", &u32s(&[0, 3]));
         let traf = boxed(b"traf", &[tfhd, tfdt, first, second].concat());
         let moof = boxed(b"moof", &traf);
-        let track = Mp4Track { params: vec![], nal_len: 4, timescale: 30, default_duration: 0, start: 0 };
+        let track = Mp4Track { params: vec![], nal_len: 4, timescale: 30, default_duration: 0, start: 0, colors: Default::default() };
         let samples = parse_fragment(&moof, &track);
         assert_eq!(samples.len(), 5);
         assert_eq!(samples.iter().map(|s| s.at).collect::<Vec<_>>(), [200, 210, 220, 230, 240]);
@@ -538,7 +582,7 @@ mod tests {
         let trun = boxed(b"trun", &u32s(&[flags, 2, 500, 10, 80, 20, 120]));
         let traf = boxed(b"traf", &[tfhd, tfdt, trun].concat());
         let moof = boxed(b"moof", &traf);
-        let track = Mp4Track { params: vec![], nal_len: 4, timescale: 1000, default_duration: 40, start: 80 };
+        let track = Mp4Track { params: vec![], nal_len: 4, timescale: 1000, default_duration: 40, start: 80, colors: Default::default() };
         let samples = parse_fragment(&moof, &track);
         // First: decode time 0 + 80 - start 80. Second: decode time 40 + 120 - 80.
         assert_eq!(samples, [Sample { at: 500, size: 10, pts: 0.0 }, Sample { at: 510, size: 20, pts: 0.08 }]);
@@ -547,7 +591,7 @@ mod tests {
     #[test]
     fn a_fragment_cut_short_has_no_made_up_samples() {
         let moof = boxed(b"moof", &[0; 40]);
-        let track = Mp4Track { params: vec![], nal_len: 4, timescale: 1000, default_duration: 40, start: 0 };
+        let track = Mp4Track { params: vec![], nal_len: 4, timescale: 1000, default_duration: 40, start: 0, colors: Default::default() };
         assert!(parse_fragment(&moof[..20], &track).is_empty());
         assert!(parse_fragment(&moof, &track).is_empty());
     }

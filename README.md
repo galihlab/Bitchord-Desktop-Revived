@@ -46,6 +46,7 @@
 - **Lossless / Hi-Res Lossless / Dolby Atmos** — play higher-quality copies from configured hi-res addon sources when a matching copy is available, with YouTube audio as the fallback.
 - **Quality controls in the player** — see the active audio quality, prefer Dolby Atmos when available, and revert or upgrade quality from the player menu.
 - **Automix and crossfade** — DJ-style transitions between songs, with a mixing state shown in the player during transitions.
+- **Playback speed** — play songs faster or slower from a button in the player bar, from 0.5× to 2×. The pitch goes with the speed, like a record, and lyrics stay in time.
 - **Queue and playback controls** — shuffle, repeat, autoplay, song radio, next-track prefetch, volume normalization, and output device selection.
 - **Downloads** — save songs for offline playback.
 

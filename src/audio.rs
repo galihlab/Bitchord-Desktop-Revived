@@ -17,6 +17,7 @@ use crate::stream::{self, Shared};
 pub use crate::stream::TrackDecoder;
 
 pub mod eq;
+pub mod tempo;
 
 pub enum AudioCmd {
     /// A decoder is ready for playback generation `generation`; stale generations are dropped.
@@ -86,6 +87,8 @@ pub struct AudioStatus {
     crossfade_ms: AtomicU32,
     /// The equalizer's settings, applied to everything on its way to the device.
     eq: Arc<eq::EqParams>,
+    /// Playback speed, applied to each song as it plays.
+    speed: Arc<tempo::Speed>,
     /// DJ-style handoff rather than a straight-line crossfade (see `Ramp`).
     automix: AtomicBool,
     /// Tempo estimate of the playing song in BPM (f32 bits); 0 until one is heard.
@@ -99,6 +102,10 @@ pub struct AudioStatus {
 }
 
 impl AudioStatus {
+    pub fn speed(&self) -> f32 {
+        self.speed.get()
+    }
+
     pub fn position(&self) -> Duration {
         Duration::from_millis(self.position_ms.load(Ordering::Relaxed))
     }
@@ -111,7 +118,7 @@ impl AudioStatus {
             return Duration::from_millis(pos);
         }
         let age = now_ms().saturating_sub(self.sampled_at.load(Ordering::Relaxed)).min(250);
-        Duration::from_millis(pos + age)
+        Duration::from_millis(pos + (age as f32 * self.speed()) as u64)
     }
 
     pub fn outgoing_position(&self) -> Duration {
@@ -170,7 +177,8 @@ impl AudioStatus {
     }
 
     pub fn latency(&self) -> Duration {
-        Duration::from_millis(self.latency_ms.load(Ordering::Relaxed) as u64)
+        // On the song's clock: more of the song at a faster speed.
+        Duration::from_millis(self.latency_ms.load(Ordering::Relaxed) as u64).mul_f32(self.speed())
     }
 
     pub fn level(&self) -> f32 {
@@ -586,6 +594,11 @@ impl AudioHandle {
         self.status.eq.set(on, gains, no_clip);
     }
 
+    /// Takes effect at once; the pitch goes with it.
+    pub fn set_speed(&self, speed: f32) {
+        self.status.speed.set(speed);
+    }
+
     /// Automix's handoff shape for the crossfade (see `Ramp::MixIn`).
     pub fn set_automix(&self, on: bool) {
         self.status.automix.store(on, Ordering::Relaxed);
@@ -651,7 +664,8 @@ fn build_seek(mut j: SeekJob, pending: &std::sync::Mutex<Option<SeekJob>>, tx: &
 /// A song fading out under the next one, kept until it's silent.
 struct Fading {
     player: Player,
-    offset: Duration,
+    /// Where the fading song is up to, on its own clock (see `Tempo`).
+    song_ms: Arc<AtomicU64>,
     shared: Option<Arc<Shared>>,
     out: Arc<AtomicU32>,
     /// Still at full volume, waiting for the next song to start (as Morphe does): when
@@ -962,9 +976,10 @@ fn run(
     // Generation of the source currently in the player (0 = nothing loaded).
     let mut current: u64 = 0;
     let mut shared: Option<Arc<Shared>> = None;
-    // The player counts position from when a source was appended; a swapped-in
-    // seeked decoder starts at `offset`.
-    let mut offset = Duration::ZERO;
+    // Where the playing song is up to, on its own clock (see `Tempo`).
+    let mut song_ms = Arc::new(AtomicU64::new(0));
+    let song_pos = |ms: &AtomicU64| Duration::from_millis(ms.load(Ordering::Relaxed));
+    let tempo = |decoder, from, ms: &Arc<AtomicU64>| tempo::Tempo::new(decoder, status.speed.clone(), from, ms.clone());
     // Whether the playing decoder can seek in place (it indexed the whole file).
     let mut seekable = false;
     // Latest seek; a slower, older seek's decoder must not land after a newer one.
@@ -1007,7 +1022,8 @@ fn run(
                 status.mix_duration_ms.store(fade_in, Ordering::Relaxed);
                 status.mix_active.store(mix, Ordering::Relaxed);
                 status.mix_generation.store(generation, Ordering::Release);
-                player.append(Meter::new(decoder, status.clone(), fade_in, fade_out.clone(), mix, s.tempo.clone()));
+                song_ms = Arc::new(AtomicU64::new(0));
+                player.append(Meter::new(tempo(decoder, at, &song_ms), status.clone(), fade_in, fade_out.clone(), mix, s.tempo.clone()));
                 player.play();
                 // 0 means the stream didn't say; keep the length the UI already knows.
                 if s.duration_ms > 0 {
@@ -1020,7 +1036,6 @@ fn run(
                     old.cancel();
                 }
                 current = generation;
-                offset = at;
                 seekable = !at.is_zero();
                 ending_sent = false;
                 status.stream_ms.store(s.duration_ms, Ordering::Relaxed);
@@ -1037,17 +1052,17 @@ fn run(
                 player.clear();
                 fade_out = Arc::new(AtomicU32::new(0));
                 let analysis = shared.as_ref().expect("a current generation has a stream").tempo.clone();
-                player.append(Meter::new(decoder, status.clone(), 0, fade_out.clone(), false, analysis));
+                song_ms = Arc::new(AtomicU64::new(0));
+                player.append(Meter::new(tempo(decoder, at, &song_ms), status.clone(), 0, fade_out.clone(), false, analysis));
                 if !paused {
                     player.play();
                 }
-                offset = at;
                 // Paused, nothing else tells the UI (and the system media controls) where it is now.
                 status.set_position(at.as_millis() as u64);
                 wake();
             }
             Ok(AudioCmd::Pause) => {
-                log::debug!("audio: pause at {:?}", offset + player.get_pos());
+                log::debug!("audio: pause at {:?}", song_pos(&song_ms));
                 player.pause();
                 fading.iter().for_each(|f| f.player.pause());
                 status.playing.store(false, Ordering::Relaxed);
@@ -1077,10 +1092,11 @@ fn run(
                     && fading.iter().all(|f| f.player.empty()) =>
             {
                 // Keeps playing at full volume until the next song starts (see `Start`).
-                let left = length.map(|d| d.saturating_sub(offset + player.get_pos()));
+                // In real time, at the speed it's playing.
+                let left = length.map(|d| d.saturating_sub(song_pos(&song_ms)).div_f32(status.speed()));
                 log::debug!("audio: handing off from generation {current}, {left:?} left");
                 let old = std::mem::replace(&mut player, Player::connect_new(&output.mixer));
-                fading.push(Fading { player: old, offset, shared: shared.take(), out: fade_out.clone(), waiting: Some((Instant::now(), left)), natural: ending_sent });
+                fading.push(Fading { player: old, song_ms: song_ms.clone(), shared: shared.take(), out: fade_out.clone(), waiting: Some((Instant::now(), left)), natural: ending_sent });
                 current = 0;
                 status.playing.store(false, Ordering::Relaxed);
                 status.set_position(0);
@@ -1098,7 +1114,7 @@ fn run(
                     if current != 0 && !player.is_paused() && !player.empty() {
                         fade_out.store(QUICK_FADE_MS, Ordering::Relaxed);
                         let old = std::mem::replace(&mut player, Player::connect_new(&output.mixer));
-                        fading.push(Fading { player: old, offset, shared: shared.take(), out: fade_out.clone(), waiting: None, natural: false });
+                        fading.push(Fading { player: old, song_ms: song_ms.clone(), shared: shared.take(), out: fade_out.clone(), waiting: None, natural: false });
                     } else {
                         player.clear();
                     }
@@ -1133,7 +1149,6 @@ fn run(
                 // A seekable decoder already indexed the (fully downloaded) file.
                 if seekable && player.try_seek(pos).is_ok() {
                     log::debug!("audio: seek to {pos:?} in place");
-                    offset = Duration::ZERO;
                     status.set_position(pos.as_millis() as u64);
                     wake();
                     continue;
@@ -1197,7 +1212,7 @@ fn run(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
         }
 
-        if current != 0 && dev_lost.is_some_and(|at| offset + player.get_pos() >= at) {
+        if current != 0 && dev_lost.is_some_and(|lost| song_pos(&song_ms) >= lost) {
             dev_lost = None;
             log::info!("audio: dev hook: output device lost");
             output.sink = None;
@@ -1217,7 +1232,7 @@ fn run(
         }
         if !fading.is_empty() {
             if let Some(f) = fading.iter().find(|f| f.natural) {
-                status.sample_outgoing(f.offset + f.player.get_pos(), !f.player.is_paused() && !f.player.empty());
+                status.sample_outgoing(song_pos(&f.song_ms), !f.player.is_paused() && !f.player.empty());
             }
             // The next song is taking too long: don't hold this one up any longer.
             for f in fading.iter_mut().filter(|f| !status.automix.load(Ordering::Relaxed) && f.waiting.is_some_and(|(at, _)| at.elapsed() > HANDOFF_WAIT)) {
@@ -1232,11 +1247,11 @@ fn run(
             }
         }
         if current != 0 {
-            let pos = offset + player.get_pos();
+            let pos = song_pos(&song_ms);
             status.set_position(pos.as_millis() as u64);
             // Start the next song early, to crossfade into it. Not for songs barely
-            // longer than the fade.
-            let crossfade = Duration::from_millis(mix_ms(&status, length) as u64);
+            // longer than the fade. (The fade's in real time: more of the song when faster.)
+            let crossfade = Duration::from_millis(mix_ms(&status, length) as u64).mul_f32(status.speed());
             if !ending_sent
                 && !crossfade.is_zero()
                 && let Some(d) = length
@@ -1252,7 +1267,7 @@ fn run(
             if player.empty() {
                 // A failed download ends the decoder early: that's not the song ending.
                 let event = match shared.as_ref().and_then(|s| s.error()) {
-                    Some(reason) => AudioEvent::Interrupted { generation: current, at: offset + player.get_pos(), reason },
+                    Some(reason) => AudioEvent::Interrupted { generation: current, at: song_pos(&song_ms), reason },
                     None => AudioEvent::Finished { generation: current },
                 };
                 let _ = events.send(event);

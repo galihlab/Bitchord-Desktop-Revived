@@ -281,6 +281,12 @@ pub fn anim_bool(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug
     ease_out(ctx.animate_bool_with_time(egui::Id::unique(id), on, secs * SPEED))
 }
 
+/// [`anim_bool`] for a transition whose length the theme sets itself, so `ui_fade_secs`
+/// leaves it alone (BitChord's `anim_bool` carries no such fade yet: the two agree).
+pub fn anim_bool_timed(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, on: bool, secs: f32) -> f32 {
+    ease_out(ctx.animate_bool_with_time(egui::Id::unique(id), on, secs * SPEED))
+}
+
 // ------------------------------------------------------------------ type
 
 pub fn regular(size: f32) -> FontId {
@@ -352,6 +358,7 @@ pub mod icon {
     pub const PIN: char = '\u{e259}';
     pub const PIN_OFF: char = '\u{e2b6}';
     pub const MAXIMIZE_2: char = '\u{e113}';
+    pub const PICTURE_IN_PICTURE: char = '\u{e3af}';
 }
 
 /// Inter (SIL OFL 1.1), the default face: regular / semibold / extra bold, subset to

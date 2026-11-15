@@ -21,9 +21,8 @@ use crate::innertube::VideoStream;
 const READY: usize = 12;
 /// Decoded this far behind the clock, a frame isn't worth converting: it would never show.
 const LATE: f64 = 0.05;
-/// A clock this far outside what's decoded is a seek.
+/// The clock this far before what's waiting to show is a seek back.
 const SEEK_BACK: f64 = 0.5;
-const SEEK_AHEAD: f64 = 6.0;
 
 // ---------------------------------------------------------------------------- MP4
 
@@ -65,6 +64,180 @@ pub struct Track {
     default_duration: u32,
     /// The presentation time of the first sample, in timescale units.
     start: i64,
+    colors: Colors,
+}
+
+/// How a picture's numbers turn into colours, as its stream's header says: the range black
+/// and white are at, and the matrix. A stream that doesn't say gets YouTube's own: TV range
+/// (black at 16, white at 235) and BT.709, which its H.264 is at every size.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Colors {
+    full_range: bool,
+    /// BT.601's matrix, as SD broadcasts have, rather than BT.709's.
+    bt601: bool,
+}
+
+/// [`Colors`] as sums, in 65536ths: light from `y` less `black`, red from v, green from both,
+/// blue from u.
+pub(crate) struct ToRgb {
+    black: i32,
+    y: i32,
+    rv: i32,
+    gu: i32,
+    gv: i32,
+    bu: i32,
+}
+
+impl Colors {
+    pub(crate) fn to_rgb(self) -> ToRgb {
+        let (kr, kb) = if self.bt601 { (0.299, 0.114) } else { (0.2126, 0.0722) };
+        let kg = 1.0 - kr - kb;
+        // TV range spreads 16..=235 (and colour's ±112) out over all of 0..=255.
+        let (black, y, c) = if self.full_range { (0, 1.0, 1.0) } else { (16, 255.0 / 219.0, 255.0 / 224.0) };
+        let f = |x: f64| (x * 65536.0).round() as i32;
+        ToRgb { black, y: f(y), rv: f(2.0 * (1.0 - kr) * c), gu: f(2.0 * (1.0 - kb) * kb / kg * c), gv: f(2.0 * (1.0 - kr) * kr / kg * c), bu: f(2.0 * (1.0 - kb) * c) }
+    }
+}
+
+impl ToRgb {
+    #[inline]
+    pub(crate) fn rgb(&self, y: i32, u: u8, v: u8) -> egui::Color32 {
+        let l = (y - self.black) * self.y + 32768;
+        let (u, v) = (u as i32 - 128, v as i32 - 128);
+        let c = |x: i32| (x >> 16).clamp(0, 255) as u8;
+        egui::Color32::from_rgb(c(l + self.rv * v), c(l - self.gu * u - self.gv * v), c(l + self.bu * u))
+    }
+}
+
+/// What a sequence parameter set (an SPS NAL unit, header byte and all) says of colours, from
+/// its video usability information; `None` if it's cut short.
+pub(crate) fn sps_colors(nal: &[u8]) -> Option<Colors> {
+    if nal.first()? & 0x1f != 7 {
+        return None;
+    }
+    // Without the bytes that keep start codes out of it: a 3 after two zeros.
+    let mut rbsp = Vec::with_capacity(nal.len());
+    let mut zeros = 0;
+    for &b in nal.get(1..)? {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        rbsp.push(b);
+    }
+    let mut r = Bits { b: &rbsp, at: 0 };
+    let profile = r.bits(8)?;
+    r.bits(16)?; // constraint flags, level
+    r.ue()?; // id
+    if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
+        let chroma = r.ue()?;
+        if chroma == 3 {
+            r.bit()?;
+        }
+        r.ue()?; // bit depths
+        r.ue()?;
+        r.bit()?;
+        if r.bit()? == 1 {
+            // Scaling lists: read through for their length.
+            for i in 0..if chroma == 3 { 12 } else { 8 } {
+                if r.bit()? == 1 {
+                    let (mut last, mut next) = (8, 8);
+                    for _ in 0..if i < 6 { 16 } else { 64 } {
+                        if next != 0 {
+                            next = (last + r.se()? + 256) % 256;
+                        }
+                        if next != 0 {
+                            last = next;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    r.ue()?; // frame number size
+    match r.ue()? {
+        0 => {
+            r.ue()?;
+        }
+        1 => {
+            r.bit()?;
+            r.se()?;
+            r.se()?;
+            for _ in 0..r.ue()? {
+                r.se()?;
+            }
+        }
+        _ => {}
+    }
+    r.ue()?; // reference frames
+    r.bit()?;
+    r.ue()?; // size in macroblocks
+    r.ue()?;
+    if r.bit()? == 0 {
+        r.bit()?;
+    }
+    r.bit()?;
+    if r.bit()? == 1 {
+        // Cropping.
+        for _ in 0..4 {
+            r.ue()?;
+        }
+    }
+    // No VUI, or no video signal type in it: nothing said.
+    if r.bit()? == 0 {
+        return Some(Colors::default());
+    }
+    if r.bit()? == 1 && r.bits(8)? == 255 {
+        r.bits(32)?; // the pixels' own aspect ratio
+    }
+    if r.bit()? == 1 {
+        r.bit()?; // overscan
+    }
+    if r.bit()? == 0 {
+        return Some(Colors::default());
+    }
+    r.bits(3)?; // video format
+    let full_range = r.bit()? == 1;
+    // Primaries and transfer, then the matrix: 5 and 6 are BT.601's, 1 (and unsaid) BT.709's.
+    let matrix = if r.bit()? == 1 { r.bits(24)? & 0xff } else { 2 };
+    Some(Colors { full_range, bt601: matches!(matrix, 5 | 6) })
+}
+
+/// Reads an SPS bit by bit.
+struct Bits<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl Bits<'_> {
+    fn bit(&mut self) -> Option<u32> {
+        let byte = *self.b.get(self.at / 8)?;
+        let bit = byte >> (7 - self.at % 8) & 1;
+        self.at += 1;
+        Some(bit as u32)
+    }
+
+    fn bits(&mut self, n: u32) -> Option<u32> {
+        (0..n).try_fold(0, |v, _| Some(v << 1 | self.bit()?))
+    }
+
+    /// Exp-Golomb: as many zeros as bits to follow, a one, then those bits.
+    fn ue(&mut self) -> Option<u32> {
+        let mut zeros = 0;
+        while self.bit()? == 0 {
+            zeros += 1;
+            if zeros > 31 {
+                return None;
+            }
+        }
+        Some(((1u64 << zeros) - 1 + self.bits(zeros)? as u64).min(u32::MAX as u64) as u32)
+    }
+
+    fn se(&mut self) -> Option<i32> {
+        let k = self.ue()? as i64;
+        Some(if k & 1 == 1 { (k + 1) / 2 } else { -(k / 2) } as i32)
+    }
 }
 
 fn parse_track(moov: &[u8]) -> Option<Track> {
@@ -75,6 +248,8 @@ fn parse_track(moov: &[u8]) -> Option<Track> {
     let at = stsd.windows(4).position(|w| w == b"avcC")? + 4;
     let c = stsd.get(at..)?;
     let nal_len = (*c.get(4)? & 3) as usize + 1;
+    // The first SPS's: the one a stream starts with.
+    let colors = c.get(6..8).and_then(|n| c.get(8..8 + u16::from_be_bytes([n[0], n[1]]) as usize)).and_then(sps_colors).unwrap_or_default();
     let mut params = Vec::new();
     let mut o = 6;
     let mut copy = |count: usize, o: &mut usize| -> Option<()> {
@@ -93,7 +268,7 @@ fn parse_track(moov: &[u8]) -> Option<Track> {
     let default_duration = find(moov, &["mvex", "trex"]).and_then(|t| be32(t, 12)).unwrap_or(0);
     // With B-frames the first frame shows late; the edit list takes that back out.
     let start = find(moov, &["trak", "edts", "elst"]).and_then(|e| if e[0] == 1 { be64(e, 16).map(|v| v as i64) } else { be32(e, 12).map(|v| v as i32 as i64) }).filter(|v| *v > 0).unwrap_or(0);
-    Some(Track { params, nal_len, timescale, default_duration, start })
+    Some(Track { params, nal_len, timescale, default_duration, start, colors })
 }
 
 /// One piece of the file, from its index.
@@ -344,97 +519,190 @@ impl Ord for Pts {
     }
 }
 
-fn to_image(yuv: &openh264::decoder::DecodedYUV) -> egui::ColorImage {
+/// The picture in `colors`. Not openh264's own `write_rgba8`, which takes every stream for
+/// full range and BT.601: on YouTube's that lifts black to grey.
+fn to_image(yuv: &openh264::decoder::DecodedYUV, colors: Colors) -> egui::ColorImage {
     let (w, h) = yuv.dimensions();
-    let mut rgba = vec![0u8; w * h * 4];
-    yuv.write_rgba8(&mut rgba);
-    egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+    let (ys, us, vs) = yuv.strides();
+    let (y, u, v) = (yuv.y(), yuv.u(), yuv.v());
+    let m = colors.to_rgb();
+    let mut pixels = Vec::with_capacity(w * h);
+    for row in 0..h {
+        let (yr, ur, vr) = (&y[row * ys..], &u[row / 2 * us..], &v[row / 2 * vs..]);
+        pixels.extend((0..w).map(|x| m.rgb(yr[x] as i32, ur[x / 2], vr[x / 2])));
+    }
+    egui::ColorImage { size: [w, h], source_size: egui::vec2(w as f32, h as f32), pixels }
 }
 
 fn run(stream: &VideoStream, http: &reqwest::Client, status: &AudioStatus, shared: &Shared) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let fetch = |from: u64, to: u64| -> anyhow::Result<Vec<u8>> {
-        rt.block_on(async {
-            let url = format!("{}&range={from}-{to}", stream.url);
-            let mut last = None;
-            for _ in 0..3 {
-                let got = async { anyhow::Ok(http.get(&url).header("User-Agent", crate::innertube::UA).timeout(Duration::from_secs(30)).send().await?.error_for_status()?.bytes().await?.to_vec()) };
-                match got.await {
-                    Ok(b) => return Ok(b),
-                    Err(e) => last = Some(e),
-                }
-            }
-            Err(last.unwrap_or_else(|| anyhow::anyhow!("no answer")))
-        })
-    };
-    let head = fetch(0, stream.init_end)?;
-    let track = parse_track(find(&head, &["moov"]).ok_or_else(|| anyhow::anyhow!("no moov"))?).ok_or_else(|| anyhow::anyhow!("not H.264 in MP4"))?;
-    let index = fetch(stream.index.0, stream.index.1)?;
-    let fragments = find(&index, &["sidx"]).and_then(|s| parse_index(s, stream.index.1 + 1)).filter(|f| !f.is_empty()).ok_or_else(|| anyhow::anyhow!("no index"))?;
+    let download = |from: u64, to: u64| Download { rt: &rt, http, url: &stream.url, from, to, resp: None, tries: 0 };
+    // The header and the index after it, in one request.
+    let start = download(0, stream.index.1).all()?;
+    let head = start.get(..=stream.init_end as usize).ok_or_else(|| anyhow::anyhow!("short header"))?;
+    let index = start.get(stream.index.0 as usize..).ok_or_else(|| anyhow::anyhow!("short index"))?;
+    let track = parse_track(find(head, &["moov"]).ok_or_else(|| anyhow::anyhow!("no moov"))?).ok_or_else(|| anyhow::anyhow!("not H.264 in MP4"))?;
+    let fragments = find(index, &["sidx"]).and_then(|s| parse_index(s, stream.index.1 + 1)).filter(|f| !f.is_empty()).ok_or_else(|| anyhow::anyhow!("no index"))?;
     log::info!("video: {}x{}, {} fragments", stream.width, stream.height, fragments.len());
 
     let mut decoder = new_decoder(&track)?;
     let mut next = fragment_at(&fragments, status.position_smooth().as_secs_f64());
     let mut pending: BinaryHeap<Pts> = BinaryHeap::new();
-    // Where decoding has got to, for telling a seek from just playing on.
-    let mut decoded_to = fragments[next].start;
+    // The last frame out of the decoder: with none waiting to show, where the picture is.
+    let mut last_out = fragments[next].start;
+    // Where to start over, from deeper in.
+    let mut restart = None;
+    // Since starting or starting over, until there's a picture: for the log.
+    let mut waiting_since = Some((std::time::Instant::now(), fragments[next].start));
+    // The earliest frame still to show.
+    let showing_from = |last_out: f64| shared.frames.lock().unwrap().front().map_or(last_out, |f| f.pts);
     'play: while !shared.stop.load(Ordering::Relaxed) {
         let clock = status.position_smooth().as_secs_f64();
-        if clock < decoded_to - seek_margin(&shared.frames) || clock > decoded_to + SEEK_AHEAD {
-            next = fragment_at(&fragments, clock);
-            decoded_to = fragments[next].start;
+        if let Some(at) = restart.take().or_else(|| seek_target(&fragments, next, clock, showing_from(last_out))) {
+            next = at;
+            last_out = fragments[at].start;
+            waiting_since = Some((std::time::Instant::now(), clock));
             decoder = new_decoder(&track)?;
             pending.clear();
             shared.frames.lock().unwrap().clear();
-        }
-        if shared.frames.lock().unwrap().len() >= READY || next >= fragments.len() {
-            std::thread::sleep(Duration::from_millis(15));
             continue;
         }
         let f = fragments[next];
-        let bytes = fetch(f.offset, f.offset + f.size as u64 - 1)?;
         next += 1;
-        for sample in parse_fragment(&bytes, &track) {
-            let Some(data) = bytes.get(sample.at..sample.at + sample.size) else { continue };
-            pending.push(Pts(sample.pts));
-            decoded_to = decoded_to.max(sample.pts);
-            let Ok(Some(yuv)) = decoder.decode(&annex_b(data, track.nal_len)) else { continue };
-            let Some(Pts(pts)) = pending.pop() else { continue };
-            let clock = status.position_smooth().as_secs_f64();
-            if pts < clock - LATE {
-                continue;
-            }
-            let frame = Frame { pts, image: to_image(&yuv) };
-            // Paused, or decoding ahead: wait with this frame for room.
-            loop {
-                if shared.stop.load(Ordering::Relaxed) {
-                    break 'play;
-                }
-                let now = status.position_smooth().as_secs_f64();
-                if now < pts - SEEK_AHEAD || now > pts + SEEK_AHEAD {
-                    // A seek: the outer loop starts over from there.
+        // Decoded as it arrives: each picture once its bytes are in, not after all of them.
+        let mut dl = download(f.offset, f.offset + f.size as u64 - 1);
+        let (mut bytes, mut done) = (Vec::with_capacity(f.size as usize), 0);
+        loop {
+            let more = dl.more(&mut bytes)?;
+            let samples = parse_fragment(&bytes, &track);
+            while let Some(sample) = samples.get(done).filter(|s| s.at + s.size <= bytes.len()) {
+                done += 1;
+                let data = &bytes[sample.at..sample.at + sample.size];
+                let clock = status.position_smooth().as_secs_f64();
+                // Skipped through: on from the fragment the clock is in.
+                if let Some(at) = seek_target(&fragments, next - 1, clock, showing_from(last_out)) {
+                    restart = Some(at);
                     continue 'play;
                 }
-                if shared.frames.lock().unwrap().len() < READY {
-                    break;
+                // Catching up (starting, or after a seek): a picture nothing else is made
+                // from needn't be decoded to get to the ones that show. About half the work.
+                if sample.pts < clock - LATE && disposable(data, track.nal_len) {
+                    continue;
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                pending.push(Pts(sample.pts));
+                let Ok(Some(yuv)) = decoder.decode(&annex_b(data, track.nal_len)) else { continue };
+                let Some(Pts(pts)) = pending.pop() else { continue };
+                last_out = pts;
+                if pts < clock - LATE {
+                    continue;
+                }
+                let frame = Frame { pts, image: to_image(&yuv, track.colors) };
+                // Paused, or decoding ahead: wait with this frame for room.
+                loop {
+                    if shared.stop.load(Ordering::Relaxed) {
+                        break 'play;
+                    }
+                    let now = status.position_smooth().as_secs_f64();
+                    if let Some(at) = seek_target(&fragments, next - 1, now, showing_from(pts).min(pts)) {
+                        restart = Some(at);
+                        continue 'play;
+                    }
+                    if shared.frames.lock().unwrap().len() < READY {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                shared.frames.lock().unwrap().push_back(frame);
+                if let Some((since, from)) = waiting_since.take() {
+                    log::info!("video: picture {:.0} ms after starting at {from:.1} s", since.elapsed().as_secs_f64() * 1000.0);
+                }
             }
-            shared.frames.lock().unwrap().push_back(frame);
+            if !more {
+                break;
+            }
         }
     }
     Ok(())
 }
 
-/// How far behind what's decoded the clock may be before it's a seek: decoding runs up to
-/// a fragment ahead of what's shown, and the frames still waiting are ahead of it anyway.
-fn seek_margin(frames: &Mutex<VecDeque<Frame>>) -> f64 {
-    let frames = frames.lock().unwrap();
-    let waiting = match (frames.front(), frames.back()) {
-        (Some(a), Some(b)) => b.pts - a.pts,
-        _ => 0.0,
-    };
-    waiting + SEEK_BACK + SEEK_AHEAD
+/// Where to start decoding over when the clock has jumped: back before what's waiting to
+/// show, or on past the fragment being decoded, `current` (decoding the rest of it would
+/// only make pictures too late to show, and each fragment starts with one of its own).
+fn seek_target(fragments: &[Fragment], current: usize, clock: f64, showing_from: f64) -> Option<usize> {
+    let at = fragment_at(fragments, clock);
+    (clock < showing_from - SEEK_BACK || (at > current && current < fragments.len())).then_some(at)
+}
+
+/// Whether nothing is decoded from this sample's picture (`nal_ref_idc` 0 on all of its
+/// slices): it can be left out when it wouldn't show anyway.
+fn disposable(sample: &[u8], nal_len: usize) -> bool {
+    let (mut i, mut slices) = (0, 0);
+    while i + nal_len <= sample.len() {
+        let len = sample[i..i + nal_len].iter().fold(0usize, |n, b| n << 8 | *b as usize);
+        i += nal_len;
+        let Some(&header) = sample.get(i) else { break };
+        // Coded slices: 1, and 5 for the pictures everything after starts from.
+        if matches!(header & 0x1f, 1 | 5) {
+            if header >> 5 & 3 != 0 {
+                return false;
+            }
+            slices += 1;
+        }
+        i += len;
+    }
+    slices > 0
+}
+
+/// A range of the video, read as it arrives. One that breaks off goes on from where it got
+/// to, three times.
+struct Download<'a> {
+    rt: &'a tokio::runtime::Runtime,
+    http: &'a reqwest::Client,
+    url: &'a str,
+    from: u64,
+    to: u64,
+    resp: Option<reqwest::Response>,
+    tries: u32,
+}
+
+impl Download<'_> {
+    /// Add what has arrived since to `buf`: false once all of it has.
+    fn more(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+        loop {
+            let at = self.from + buf.len() as u64;
+            if at > self.to {
+                return Ok(false);
+            }
+            let got = self.rt.block_on(async {
+                if self.resp.is_none() {
+                    let url = format!("{}&range={at}-{}", self.url, self.to);
+                    self.resp = Some(self.http.get(&url).header("User-Agent", crate::innertube::UA).timeout(Duration::from_secs(30)).send().await?.error_for_status()?);
+                }
+                anyhow::Ok(self.resp.as_mut().expect("just set").chunk().await?)
+            });
+            match got {
+                Ok(Some(chunk)) => {
+                    buf.extend_from_slice(&chunk);
+                    return Ok(true);
+                }
+                // Ended short: ask for the rest.
+                Ok(None) => self.resp = None,
+                Err(e) => {
+                    self.resp = None;
+                    self.tries += 1;
+                    if self.tries >= 3 {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn all(mut self) -> anyhow::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        while self.more(&mut buf)? {}
+        Ok(buf)
+    }
 }
 
 #[cfg(test)]
@@ -453,7 +721,7 @@ mod tests {
     }
 
     fn track() -> Track {
-        Track { params: vec![], nal_len: 4, timescale: 1000, default_duration: 40, start: 80 }
+        Track { params: vec![], nal_len: 4, timescale: 1000, default_duration: 40, start: 80, colors: Colors::default() }
     }
 
     #[test]
@@ -466,12 +734,73 @@ mod tests {
         assert_eq!(glow[GLOW_SIZE[0] - 1], [0.0, 0.0, 200.0]);
     }
 
+    // SPS NAL units from YouTube's H.264 (a 360p Main and a 1080p High stream), which say
+    // TV range and BT.709.
+    const SPS_360: [u8; 29] = [0x67, 0x4d, 0x40, 0x1e, 0xe8, 0x80, 0x50, 0x17, 0xfc, 0xb8, 0x0b, 0x50, 0x10, 0x10, 0x14, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xc8, 0x3c, 0x58, 0xb4, 0x48];
+    const SPS_1080: [u8; 30] = [0x67, 0x64, 0x00, 0x28, 0xac, 0xd1, 0x00, 0x78, 0x02, 0x27, 0xe5, 0xc0, 0x5a, 0x80, 0x80, 0x80, 0xa0, 0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x06, 0x41, 0xe3, 0x06, 0x22, 0x40];
+
+    #[test]
+    fn a_streams_header_says_what_range_and_matrix_its_colours_are_in() {
+        let tv_709 = Colors { full_range: false, bt601: false };
+        assert_eq!(sps_colors(&SPS_360), Some(tv_709));
+        assert_eq!(sps_colors(&SPS_1080), Some(tv_709));
+        // The same header with its full-range bit set.
+        let mut full = SPS_360;
+        full[11] |= 0x20;
+        assert_eq!(sps_colors(&full), Some(Colors { full_range: true, bt601: false }));
+        // Cut off before it gets there; not an SPS at all.
+        assert_eq!(sps_colors(&SPS_360[..8]), None);
+        assert_eq!(sps_colors(&[0x68, 0xee, 0x3c, 0x80]), None);
+    }
+
+    #[test]
+    fn tv_range_black_and_white_are_black_and_white() {
+        let tv = Colors::default().to_rgb();
+        assert_eq!(tv.rgb(16, 128, 128), egui::Color32::BLACK);
+        assert_eq!(tv.rgb(235, 128, 128), egui::Color32::WHITE);
+        assert_eq!(tv.rgb(126, 128, 128), egui::Color32::from_gray(128));
+        // BT.709's pure red: Y 63, U 102, V 240.
+        let [r, g, b, _] = tv.rgb(63, 102, 240).to_array();
+        assert!(r >= 253 && g <= 2 && b <= 2, "{r} {g} {b}");
+        // Full range is as it was.
+        let full = Colors { full_range: true, bt601: true }.to_rgb();
+        assert_eq!(full.rgb(0, 128, 128), egui::Color32::BLACK);
+        assert_eq!(full.rgb(255, 128, 128), egui::Color32::WHITE);
+    }
+
     #[test]
     fn nal_units_get_start_codes() {
         let sample = [0, 0, 0, 2, 9, 9, 0, 0, 0, 1, 7];
         assert_eq!(annex_b(&sample, 4), [0, 0, 0, 1, 9, 9, 0, 0, 0, 1, 7]);
         // Cut off: what's whole stays.
         assert_eq!(annex_b(&sample[..9], 4), [0, 0, 0, 1, 9, 9]);
+    }
+
+    #[test]
+    fn any_jump_outside_whats_decoded_starts_over_where_the_clock_is() {
+        let fragments: Vec<Fragment> = (0..5).map(|i| Fragment { offset: i * 100, size: 100, start: i as f64 * 6.0 }).collect();
+        // Playing along in fragment 1, frames ready from 7 s.
+        assert_eq!(seek_target(&fragments, 1, 7.0, 7.0), None);
+        // A skip of a few seconds on, into the next fragment: from there, not decoding
+        // the rest of this one first.
+        assert_eq!(seek_target(&fragments, 1, 12.5, 7.0), Some(2));
+        // A few seconds back, inside what was decoded: over from that fragment.
+        assert_eq!(seek_target(&fragments, 1, 4.0, 7.0), Some(0));
+        // Just behind what's ready is no seek.
+        assert_eq!(seek_target(&fragments, 1, 6.8, 7.0), None);
+        // Past the last fragment, there's nothing further to go to.
+        assert_eq!(seek_target(&fragments, 5, 29.0, 28.0), None);
+    }
+
+    #[test]
+    fn only_pictures_nothing_is_made_from_can_be_left_out() {
+        // Length-prefixed NAL units: a header byte each (ref_idc in bits 5-6, type below).
+        let sample = |headers: &[u8]| headers.iter().flat_map(|&h| [0, 0, 0, 2, h, 0xAA]).collect::<Vec<u8>>();
+        assert!(disposable(&sample(&[0x01]), 4)); // a B slice nothing refers to
+        assert!(!disposable(&sample(&[0x21]), 4)); // a slice that's referred to
+        assert!(!disposable(&sample(&[0x65]), 4)); // the picture a fragment starts from
+        assert!(!disposable(&sample(&[0x06, 0x09]), 4)); // no picture at all
+        assert!(!disposable(&sample(&[0x01, 0x41]), 4)); // one slice referred to
     }
 
     #[test]

@@ -39,6 +39,122 @@ const PINNED_BY_DEFAULT: bool = true;
 const CLOSE: CloseButton = CloseButton::LikeFullWindow;
 /// From the work area's corner, the first time.
 const MARGIN: f32 = 16.0;
+/// Picture in picture: the mini player for a video, when first opened, and as small and
+/// as big as it goes. In between it takes the video's shape (#104).
+const VIDEO_SIZE: Vec2 = vec2(480.0, 270.0);
+const VIDEO_MIN: Vec2 = vec2(240.0, 135.0);
+const VIDEO_MAX: Vec2 = vec2(1280.0, 720.0);
+
+/// How long the window keeps one size before it's put in the video's shape: a resize
+/// the app can't follow (Wayland's, done by the desktop) is over by then. Windows keeps
+/// the shape as it's dragged instead, as mpv does.
+const SNAP_AFTER: f64 = 0.3;
+
+/// The size in the video's shape (`ratio`, width over height) and within `min` and `max`,
+/// keeping the width, or with `by_height` the height.
+fn in_shape(ratio: f32, size: Vec2, by_height: bool, min: Vec2, max: Vec2) -> Vec2 {
+    let lo = min.x.max(min.y * ratio);
+    let hi = max.x.min(max.y * ratio).max(lo);
+    let w = if by_height { size.y * ratio } else { size.x }.clamp(lo, hi);
+    vec2(w, w / ratio)
+}
+
+/// Whether a resize from `from` to `to` was mostly of the height, so that's the side to keep.
+fn height_led(from: Vec2, to: Vec2) -> bool {
+    (to.y - from.y).abs() / from.y.max(1.0) > (to.x - from.x).abs() / from.x.max(1.0)
+}
+
+/// The window is being dragged or resized (Windows' own loop for it): not the moment
+/// to change its size. Only Windows says.
+static MOVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Picture in picture's shape for Windows, which keeps it while the edges are dragged:
+/// the video's width over height, and the size limits, in physical pixels.
+#[cfg(windows)]
+static SHAPE: std::sync::Mutex<Option<(f32, Vec2, Vec2)>> = std::sync::Mutex::new(None);
+
+/// Keeps picture in picture in the video's shape while it's resized (Windows; elsewhere it
+/// takes the shape once the resize is over).
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub fn set_hwnd(hwnd: *mut std::ffi::c_void) {
+    #[cfg(windows)]
+    shape::init(hwnd);
+}
+
+#[cfg(windows)]
+mod shape {
+    use std::sync::atomic::Ordering;
+
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_SIZING, WMSZ_BOTTOMLEFT, WMSZ_BOTTOM, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT};
+
+    pub fn init(hwnd: *mut std::ffi::c_void) {
+        // SAFETY: the app's own window, on the thread that made it; the subclass lives as
+        // long as the window.
+        if !unsafe { SetWindowSubclass(HWND(hwnd), Some(proc), 3, 0) }.as_bool() {
+            log::warn!("picture in picture: couldn't subclass the window");
+        }
+    }
+
+    unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _: usize, _: usize) -> LRESULT {
+        match msg {
+            WM_ENTERSIZEMOVE => super::MOVING.store(true, Ordering::Relaxed),
+            WM_EXITSIZEMOVE => super::MOVING.store(false, Ordering::Relaxed),
+            _ => {}
+        }
+        // SAFETY: the window's own message, passed on as it came.
+        let result = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+        let shape = *super::SHAPE.lock().unwrap();
+        let Some((ratio, min, max)) = shape.filter(|_| msg == WM_SIZING) else { return result };
+        let (mut outer, mut inner) = (RECT::default(), RECT::default());
+        // SAFETY: the app's own window; the rectangles are ours.
+        if unsafe { GetWindowRect(hwnd, &mut outer).is_err() || GetClientRect(hwnd, &mut inner).is_err() } {
+            return result;
+        }
+        // The frame around the inside, which the dragged rectangle includes.
+        let fx = (outer.right - outer.left) - (inner.right - inner.left);
+        let fy = (outer.bottom - outer.top) - (inner.bottom - inner.top);
+        // SAFETY: for WM_SIZING, lparam points at the window's proposed rectangle.
+        let r = unsafe { &mut *(lparam.0 as *mut RECT) };
+        let edge = wparam.0 as u32;
+        let size = egui::vec2((r.right - r.left - fx) as f32, (r.bottom - r.top - fy) as f32);
+        // Like mpv: the top or bottom edge sets the height, any other the width.
+        let fit = super::in_shape(ratio, size, edge == WMSZ_TOP || edge == WMSZ_BOTTOM, min, max);
+        let (w, h) = (fit.x.round() as i32 + fx, fit.y.round() as i32 + fy);
+        // The edges across from the one dragged stay put.
+        if matches!(edge, WMSZ_LEFT | WMSZ_TOPLEFT | WMSZ_BOTTOMLEFT) {
+            r.left = r.right - w;
+        } else {
+            r.right = r.left + w;
+        }
+        if matches!(edge, WMSZ_TOP | WMSZ_TOPLEFT | WMSZ_TOPRIGHT) {
+            r.top = r.bottom - h;
+        } else {
+            r.bottom = r.top + h;
+        }
+        LRESULT(1)
+    }
+}
+
+/// The mini player is the video (picture in picture): a video was on show when it opened.
+static VIDEO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The mini player up, or last up, is the video.
+pub fn video_active() -> bool {
+    VIDEO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+const VIDEO_KEY: &str = "mini_video_window";
+
+/// The mini player's size when first opened.
+fn mini_size() -> Vec2 {
+    if video_active() { VIDEO_SIZE } else { SIZE }
+}
+
+fn width_limits() -> (f32, f32) {
+    if video_active() { (VIDEO_MIN.x, VIDEO_MAX.x) } else { (MIN_W, MAX_W) }
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq)]
@@ -108,10 +224,10 @@ impl Place {
 /// edges, for a window with `frame` (points) around its inside. A point is `scale`
 /// times `zoom` pixels.
 fn corner_place(area: Rect, frame: Vec2, scale: f32, zoom: f32) -> Place {
-    let outer = (SIZE + frame) * scale * zoom;
+    let outer = (mini_size() + frame) * scale * zoom;
     let p = area.max - outer - Vec2::splat(MARGIN * scale);
     let p = p.max(area.min);
-    Place { x: p.x.round(), y: p.y.round(), w: SIZE.x, h: SIZE.y, scale, zoom }
+    Place { x: p.x.round(), y: p.y.round(), w: mini_size().x, h: mini_size().y, scale, zoom }
 }
 
 /// A window `size` (points) in the middle of `area` (physical pixels), kept inside it.
@@ -134,7 +250,10 @@ const SYSTEM: Screens = Screens { on_a_monitor: crate::fullscreen::on_a_monitor,
 
 /// A remembered strip size, within the limits (they may have changed since).
 fn clamp_size(p: Place) -> Place {
-    Place { w: p.w.clamp(MIN_W, MAX_W), h: SIZE.y, ..p }
+    let (min, max) = width_limits();
+    // The video's is any height in its limits; the strip has one.
+    let h = if video_active() { p.h.clamp(VIDEO_MIN.y, VIDEO_MAX.y) } else { mini_size().y };
+    Place { w: p.w.clamp(min, max), h, ..p }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -174,6 +293,8 @@ pub struct Mini {
     pub pinned: bool,
     /// The strip's last place.
     place: Option<Place>,
+    /// Picture in picture's.
+    video_place: Option<Place>,
     /// The full window's, from before it shrank, and whether it was maximized.
     full: Option<(Place, bool)>,
     was_maximized: bool,
@@ -187,6 +308,14 @@ pub struct Mini {
     screens: Screens,
     /// The full window's normal place after coming back maximized, until it's restored down.
     restored_max: Option<Place>,
+    /// The shown video's width over height, while picture in picture has one.
+    pub video_shape: Option<f32>,
+    /// Picture in picture's last size in the video's shape, to tell which side a resize changed.
+    shaped: Option<Vec2>,
+    /// The window's size, and since when it's had it.
+    sized: Option<(Vec2, f64)>,
+    /// A size the video's shape was asked for from, so a desktop that says no isn't asked again.
+    asked_from: Option<Vec2>,
 }
 
 impl Mini {
@@ -195,6 +324,7 @@ impl Mini {
             on: false,
             pinned: get("mini_pinned").map_or(PINNED_BY_DEFAULT, |v| v == "1"),
             place: get("mini_window").and_then(|v| serde_json::from_str(&v).ok()).map(clamp_size),
+            video_place: get(VIDEO_KEY).and_then(|v| serde_json::from_str::<Place>(&v).ok()),
             full: None,
             was_maximized: false,
             switch: None,
@@ -203,13 +333,70 @@ impl Mini {
             limits_scale: None,
             screens: SYSTEM,
             restored_max: None,
+            video_shape: None,
+            shaped: None,
+            sized: None,
+            asked_from: None,
         }
+    }
+
+    /// Picture in picture takes the video's shape: Windows keeps it while an edge is
+    /// dragged, and any other resize gets it once it's over (keeping the side changed),
+    /// as does a video of another shape coming on.
+    fn keep_shape(&mut self, ctx: &egui::Context, now: f64, still: bool) {
+        let ratio = self.video_shape.filter(|_| still && self.showing() && video_active() && self.switch.is_none());
+        #[cfg(windows)]
+        {
+            let px = ctx.pixels_per_point();
+            *SHAPE.lock().unwrap() = ratio.map(|r| (r, VIDEO_MIN * px, VIDEO_MAX * px));
+        }
+        let Some(ratio) = ratio else {
+            if !self.showing() {
+                self.video_shape = None;
+            }
+            (self.shaped, self.sized, self.asked_from) = (None, None, None);
+            return;
+        };
+        let size = ctx.content_rect().size();
+        if (size.x / ratio - size.y).abs() < 1.5 {
+            (self.shaped, self.asked_from) = (Some(size), None);
+            return;
+        }
+        let since = match self.sized {
+            Some((s, since)) if (s - size).length() < 0.5 => since,
+            _ => {
+                self.sized = Some((size, now));
+                now
+            }
+        };
+        if self.asked_from.is_some_and(|a| (a - size).length() < 0.5) {
+            return;
+        }
+        // Still being dragged: not yet. (The app may not see the button let go after a
+        // resize the system did, so the pointer can't say.)
+        if MOVING.load(std::sync::atomic::Ordering::Relaxed) {
+            self.sized = Some((size, now));
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+        let wait = SNAP_AFTER - (now - since);
+        if wait > 0.0 {
+            ctx.request_repaint_after(Duration::from_secs_f64(wait.max(0.05)));
+            return;
+        }
+        let by_height = self.shaped.is_some_and(|from| height_led(from, size));
+        let target = in_shape(ratio, size, by_height, VIDEO_MIN, VIDEO_MAX);
+        log::debug!("picture in picture: {size:?} to the video's shape, {target:?}");
+        self.asked_from = Some(size);
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
     }
 
     pub fn save(&self, storage: &mut dyn eframe::Storage) {
         storage.set_string("mini_pinned", if self.pinned { "1" } else { "0" }.into());
-        if let Some(p) = &self.place {
-            storage.set_string("mini_window", serde_json::to_string(p).unwrap_or_default());
+        for (key, place) in [("mini_window", &self.place), (VIDEO_KEY, &self.video_place)] {
+            if let Some(p) = place {
+                storage.set_string(key, serde_json::to_string(p).unwrap_or_default());
+            }
         }
     }
 
@@ -278,12 +465,34 @@ impl Mini {
         ctx.layer_painter(layer).rect_filled(ctx.content_rect(), 0.0, base.gamma_multiply(1.0 - theme::ease_out(t)));
     }
 
+    /// This mini player's last place.
+    fn place(&self) -> Option<Place> {
+        if video_active() { self.video_place } else { self.place }
+    }
+
+    fn set_place(&mut self, p: Place) {
+        if video_active() {
+            self.video_place = Some(clamp_size(p));
+        } else {
+            self.place = Some(p);
+        }
+    }
+
     /// Switch to the strip or back. The full window leaves full screen first (the caller's).
-    pub fn toggle(&mut self, ctx: &egui::Context, now: f64) {
+    /// `video`: going to the mini player with a video on show, which it then plays.
+    pub fn toggle(&mut self, ctx: &egui::Context, now: f64, video: bool) {
         if self.switch.is_some() {
             return;
         }
         let to_mini = !self.on;
+        if to_mini {
+            VIDEO.store(video, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Named like a browser's picture in picture while it's one. Wayland lets no app put
+        // itself above others: a KDE window rule for this title (and the app, BitChord) can.
+        if video_active() {
+            ctx.send_viewport_cmd(ViewportCommand::Title(if to_mini { "Picture in picture" } else { "BitChord" }.into()));
+        }
         let mut step = Step::Resize;
         if to_mini {
             self.was_maximized = ctx.input(|i| i.viewport().maximized == Some(true));
@@ -322,10 +531,11 @@ impl Mini {
         if self.showing()
             && !minimized
             && !maximized
-            && let Some(p) = Place::current(ctx).filter(|p| p.w >= MIN_W - 1.0)
+            && let Some(p) = Place::current(ctx).filter(|p| p.w >= width_limits().0 - 1.0)
         {
-            self.place = Some(clamp_size(p));
+            self.set_place(p);
         }
+        self.keep_shape(ctx, now, !minimized && !maximized);
         let Some(sw) = &mut self.switch else { return };
         ctx.request_repaint_after(Duration::from_millis(16));
         let waited = now - sw.since;
@@ -387,11 +597,11 @@ impl Mini {
         });
         if to_mini {
             self.full = now_place.map(|p| (p, self.was_maximized));
-            let target = match (self.place, now_place) {
+            let target = match (self.place(), now_place) {
                 // Test runs stay off-screen, where they are; YTM_MINI_W tries other widths.
                 (_, Some(here)) if std::env::var_os("YTM_BACKGROUND").is_some() => {
-                    let w = std::env::var("YTM_MINI_W").ok().and_then(|w| w.parse().ok()).unwrap_or(SIZE.x);
-                    clamp_size(Place { w, ..here })
+                    let w = std::env::var("YTM_MINI_W").ok().and_then(|w| w.parse().ok()).unwrap_or(mini_size().x);
+                    clamp_size(Place { w, h: mini_size().y, ..here })
                 }
                 (Some(p), _) if self.visible(p, frame) => p,
                 (_, here) => {
@@ -399,7 +609,7 @@ impl Mini {
                     // Not Windows: the bottom right of the full window, where the player bar was.
                     let area = (self.screens.work_area)()
                         .or_else(|| here.map(|h| h.rect_px(frame)))
-                        .unwrap_or(Rect::from_min_size(Pos2::ZERO, SIZE * scale));
+                        .unwrap_or(Rect::from_min_size(Pos2::ZERO, mini_size() * scale));
                     corner_place(area, frame, scale, ctx.zoom_factor())
                 }
             };
@@ -407,7 +617,7 @@ impl Mini {
             self.go(ctx, target, false, true)
         } else {
             if let Some(p) = now_place {
-                self.place = Some(clamp_size(p));
+                self.set_place(p);
             }
             ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
             // Kept until the window has settled: a save meanwhile still writes it.
@@ -459,9 +669,13 @@ impl Mini {
     /// The window's size limits for a mode. Shrinking sets them first, so the full
     /// window's minimum doesn't hold the strip up.
     fn limits(&mut self, ctx: &egui::Context, mini: bool) {
-        if mini {
-            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(vec2(MIN_W, SIZE.y)));
-            ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(vec2(MAX_W, SIZE.y)));
+        if mini && video_active() {
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(VIDEO_MIN));
+            ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(VIDEO_MAX));
+        } else if mini {
+            let (min, max) = width_limits();
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(vec2(min, mini_size().y)));
+            ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(vec2(max, mini_size().y)));
         } else {
             ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(Vec2::INFINITY));
             ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::from(crate::MIN_SIZE)));
@@ -705,6 +919,116 @@ pub fn strip(app: &mut App, ui: &mut Ui, now: f64) {
     seek_line(app, ui, r, track.as_ref());
 }
 
+/// Picture in picture: the video filling the window (its cover for a song that plays
+/// after it). Pointed at, previous / play / next over it, pin, the full window and close
+/// at the top right, and a seek line. Drag to move, double-click for the full window.
+pub fn video_pip(app: &mut App, ui: &mut Ui, _now: f64) {
+    let ctx = ui.ctx().clone();
+    let r = ctx.content_rect();
+    if titlebar::drag_strip(ui, r, "pip").double_clicked() {
+        app.actions.push(Action::Mini(false));
+    }
+    ui.painter().rect_filled(r, 0.0, Color32::BLACK);
+    let track = app.current().cloned();
+    let video = track.as_ref().filter(|t| app.video_mode(t));
+    let frame = video.and_then(|t| super::nowplaying::video_frame(app, &ctx, t));
+    // The window takes its shape (see `keep_shape`); a song without a video leaves it be.
+    app.mini.video_shape = frame.as_ref().map(|tex| tex.size_vec2()).filter(|s| s.x > 0.0 && s.y > 0.0).map(|s| s.x / s.y);
+    match (&frame, &track) {
+        (Some(tex), _) => {
+            let size = tex.size_vec2();
+            let fit = size * (r.width() / size.x).min(r.height() / size.y);
+            egui::Image::from_texture((tex.id(), fit)).paint_at(ui, Rect::from_center_size(r.center(), fit));
+        }
+        (None, Some(t)) if video.is_some() => {
+            let fit = vec2(16.0, 9.0) * (r.width() / 16.0).min(r.height() / 9.0);
+            super::nowplaying::video_placeholder(ui, Rect::from_center_size(r.center(), fit), t, 0.0);
+        }
+        (None, Some(t)) => paint_cover(ui, Rect::from_center_size(r.center(), Vec2::splat(r.height() - 24.0)), &t.thumbs, theme::thumb_radius() + 2.0, 1.0),
+        (None, None) => icon_at(ui, r.center(), icon::MUSIC, 32.0, theme::text_faint()),
+    }
+
+    // The controls, while pointed at (or one has the keyboard).
+    let keys = ["prev", "play", "next", "pin", "full", "close"];
+    let btn_id = |key: &str| egui::Id::unique(("pip-btn", key));
+    let focused = ctx.memory(|m| m.focused()).is_some_and(|f| keys.iter().any(|k| btn_id(k) == f));
+    let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| r.contains(p));
+    let reveal = theme::anim_bool(&ctx, "pip-controls", over || focused, 0.15);
+    if reveal <= 0.0 {
+        return;
+    }
+    ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha((110.0 * reveal) as u8));
+    let enabled = track.is_some();
+    let btn = |ui: &mut Ui, c: Pos2, side: f32, key: &str, name: &str| -> egui::Response {
+        let b = Rect::from_center_size(c, Vec2::splat(side));
+        let resp = named(ui.interact(b, btn_id(key), Sense::click()), name).on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.12);
+        if h > 0.0 {
+            ui.painter().circle_filled(c, side / 2.0, Color32::WHITE.gamma_multiply(0.16 * h * reveal));
+        }
+        if resp.has_focus() {
+            ui.painter().circle_stroke(c, side / 2.0 - 1.0, egui::Stroke::new(1.5, Color32::WHITE));
+        }
+        resp
+    };
+    // Not while still fading in: a quick click there was meant for the window.
+    let live = |resp: &egui::Response| resp.clicked() && (reveal > 0.5 || resp.has_focus());
+    let white = Color32::WHITE.gamma_multiply(reveal);
+
+    // Previous, play, next, in the middle.
+    let c = r.center();
+    let gap = (r.width() * 0.16).clamp(48.0, 84.0);
+    let prev = btn(ui, c - vec2(gap, 0.0), 44.0, "prev", "Previous");
+    glyphs::draw(ui, c - vec2(gap, 0.0), 22.0, glyphs::PREVIOUS, white);
+    if live(&prev) && enabled {
+        app.prev();
+    }
+    let next = btn(ui, c + vec2(gap, 0.0), 44.0, "next", "Next");
+    glyphs::draw(ui, c + vec2(gap, 0.0), 22.0, glyphs::NEXT, white);
+    if live(&next) && enabled {
+        app.next();
+    }
+    let play = btn(ui, c, 56.0, "play", if app.playing() { "Pause" } else { "Play" });
+    ui.painter().circle_filled(c, 26.0, white);
+    let black = Color32::BLACK.gamma_multiply(reveal);
+    let morph = theme::anim_bool(&ctx, "pip-play-morph", app.playing() || app.buffering, 0.18);
+    if morph < 1.0 {
+        glyphs::draw(ui, c, 26.0, glyphs::PLAY, theme::with_alpha(black, 1.0 - morph));
+    }
+    if morph > 0.0 {
+        glyphs::draw(ui, c, 26.0, glyphs::PAUSE, theme::with_alpha(black, morph));
+    }
+    if live(&play) && enabled {
+        app.toggle();
+    }
+
+    // Top right: close (with no system frame to have one), the full window, pin.
+    let mut x = r.right() - 22.0;
+    let mut corner = |ui: &mut Ui, glyph: char, key: &str, name: &str| -> bool {
+        let resp = btn(ui, pos2(x, r.top() + 22.0), 32.0, key, name);
+        icon_at(ui, pos2(x, r.top() + 22.0), glyph, 16.0, white);
+        x -= 36.0;
+        live(&resp)
+    };
+    if titlebar::custom() && corner(ui, icon::X, "close", "Close") {
+        match CLOSE {
+            CloseButton::LikeFullWindow => ctx.send_viewport_cmd(ViewportCommand::Close),
+            CloseButton::Expand => app.actions.push(Action::Mini(false)),
+        }
+    }
+    if corner(ui, icon::MAXIMIZE_2, "full", "Full window (Ctrl+M)") {
+        app.actions.push(Action::Mini(false));
+    }
+    let pinned = app.mini.pinned;
+    if corner(ui, if pinned { icon::PIN } else { icon::PIN_OFF }, "pin", if pinned { "Stop keeping on top" } else { "Keep on top" }) {
+        app.mini.set_pinned(&ctx, !pinned);
+    }
+
+    let mut faded = ui.new_child(egui::UiBuilder::new().max_rect(r));
+    faded.multiply_opacity(reveal);
+    seek_line(app, &mut faded, r, track.as_ref());
+}
+
 /// A line along the bottom; thicker on hover, with the time under the pointer.
 fn seek_line(app: &mut App, ui: &mut Ui, r: Rect, track: Option<&crate::model::Track>) {
     let status = app.audio.status.clone();
@@ -762,6 +1086,29 @@ fn seek_line(app: &mut App, ui: &mut Ui, r: Rect, track: Option<&crate::model::T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picture_in_picture_takes_the_videos_shape_within_its_limits() {
+        let wide = 16.0 / 9.0;
+        // A 4:3 video in the first 16:9 window: the width stays.
+        assert_eq!(in_shape(4.0 / 3.0, vec2(480.0, 270.0), false, VIDEO_MIN, VIDEO_MAX), vec2(480.0, 360.0));
+        // Made taller: the height stays.
+        assert_eq!(in_shape(wide, vec2(480.0, 360.0), true, VIDEO_MIN, VIDEO_MAX), vec2(640.0, 360.0));
+        // Never past the limits, in either direction, and still the video's shape.
+        assert_eq!(in_shape(wide, vec2(2000.0, 100.0), false, VIDEO_MIN, VIDEO_MAX), vec2(1280.0, 720.0));
+        assert_eq!(in_shape(wide, vec2(100.0, 100.0), false, VIDEO_MIN, VIDEO_MAX), vec2(240.0, 135.0));
+        // A tall video can't be wider than the tallest window allows.
+        let tall = in_shape(9.0 / 16.0, vec2(480.0, 270.0), false, VIDEO_MIN, VIDEO_MAX);
+        assert!(tall.y <= VIDEO_MAX.y + 0.01 && (tall.x / tall.y - 9.0 / 16.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn the_side_a_resize_changed_more_is_the_one_kept() {
+        assert!(height_led(vec2(480.0, 270.0), vec2(490.0, 400.0)));
+        assert!(!height_led(vec2(480.0, 270.0), vec2(700.0, 280.0)));
+        // Both by the same share: the width.
+        assert!(!height_led(vec2(400.0, 200.0), vec2(800.0, 400.0)));
+    }
 
     #[test]
     fn first_place_is_the_work_areas_corner() {

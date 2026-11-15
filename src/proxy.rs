@@ -3,7 +3,8 @@
 //! yt-dlp, the sign-in windows and Listen together.
 //!
 //! - System: whatever Windows is set to (Settings › Network › Proxy), else the
-//!   `HTTPS_PROXY`/`HTTP_PROXY` environment variables, else direct.
+//!   `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY` environment variables, else direct. On
+//!   Linux and macOS, just those variables.
 //! - Off: always direct.
 //! - Custom: `http://host:port` or `socks5://host:port`, optionally `user:pass@`.
 //!
@@ -31,7 +32,8 @@ pub enum Setting {
 impl Setting {
     pub fn label(&self) -> &'static str {
         match self {
-            Setting::System => "Use Windows settings",
+            Setting::System if cfg!(windows) => "Use Windows settings",
+            Setting::System => "Use system settings",
             Setting::Off => "No proxy",
             Setting::Custom(_) => "Custom",
         }
@@ -196,6 +198,8 @@ pub async fn new_circuit(available: impl AsyncFn(&reqwest::Client) -> bool) -> b
 
 fn apply_with(b: reqwest::ClientBuilder, s: &Setting) -> reqwest::ClientBuilder {
     match (s, s.resolve()) {
+        // Outside Windows that's the environment, which reqwest reads by itself (NO_PROXY too).
+        (Setting::System, _) if cfg!(not(windows)) => b,
         (_, Some(p)) => match reqwest::Proxy::all(p.as_str()) {
             Ok(proxy) => b.proxy(proxy),
             Err(e) => {
@@ -213,10 +217,10 @@ fn apply_with(b: reqwest::ClientBuilder, s: &Setting) -> reqwest::ClientBuilder 
 /// webview can't use itself goes through the local relay instead.
 pub fn pass_to(cmd: &mut std::process::Command) {
     let v = match (active(), RELAY.get()) {
-        (Setting::Custom(_), Some(port)) => format!("http://127.0.0.1:{port}"),
-        (Setting::Custom(u), None) => u.clone(),
-        (Setting::System, _) => "system".to_owned(),
         (Setting::Off, _) => "off".to_owned(),
+        (_, Some(port)) if needs_relay() => format!("http://127.0.0.1:{port}"),
+        (Setting::Custom(u), _) => u.clone(),
+        (Setting::System, _) => "system".to_owned(),
     };
     cmd.env(CHILD_ENV, v);
 }
@@ -224,9 +228,30 @@ pub fn pass_to(cmd: &mut std::process::Command) {
 static RELAY: OnceLock<u16> = OnceLock::new();
 
 /// Whether the sign-in windows need the relay: Chromium can't sign in to a SOCKS
-/// proxy at all, and for an HTTP one it would ask in a box of its own.
+/// proxy at all, and for an HTTP one it would ask in a box of its own; WebKitGTK is
+/// only told a host and port. On Windows a system proxy is WebView2's own business.
 pub fn needs_relay() -> bool {
-    matches!(active(), Setting::Custom(_)) && active().resolve().is_some_and(|p| !p.username().is_empty() || p.scheme().starts_with("socks") || p.scheme() == "https")
+    let p = match active() {
+        Setting::Custom(_) => active().resolve(),
+        _ if cfg!(target_os = "linux") => webkit_proxy(),
+        _ => None,
+    };
+    p.is_some_and(|p| !p.username().is_empty() || p.scheme().starts_with("socks") || p.scheme() == "https")
+}
+
+/// The proxy a WebKitGTK window is told. A system one that's `https://`, or that
+/// `NO_PROXY` skips for Google, is left to WebKit, which reads those variables itself.
+fn webkit_proxy() -> Option<url::Url> {
+    match active() {
+        Setting::System => system().filter(|p| p.scheme() != "https" && !no_proxy("accounts.google.com")),
+        s => s.resolve(),
+    }
+}
+
+/// Whether `NO_PROXY` sends `host` direct.
+fn no_proxy(host: &str) -> bool {
+    let list = ["NO_PROXY", "no_proxy"].iter().find_map(|k| std::env::var(k).ok()).unwrap_or_default();
+    list.trim() == "*" || list.split(',').map(|e| e.trim().trim_start_matches('*').trim_start_matches('.')).any(|e| !e.is_empty() && (host == e || host.ends_with(&format!(".{e}"))))
 }
 
 /// A local, password-free HTTP proxy (CONNECT only) on a random loopback port that

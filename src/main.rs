@@ -59,6 +59,23 @@ pub const DEFAULT_SIZE: [f32; 2] = [1200.0, 780.0];
 pub const MIN_SIZE: [f32; 2] = [760.0, 480.0];
 
 fn main() -> eframe::Result {
+    // glibc gives each thread that allocates its own heap (up to 8 per core), and what a
+    // song frees in one isn't reused by the next song's threads: on Linux the app grew a
+    // few MB with every song. Two heaps keep the freed memory in use. And big blocks (a
+    // song's buffer, its pictures) go back to the system as soon as they're freed: glibc
+    // otherwise raises that limit past them after the first one and keeps them in its
+    // heaps. Before any thread starts; MALLOC_ARENA_MAX and MALLOC_MMAP_THRESHOLD_ still
+    // set them.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: only changes allocator settings, while the process is single-threaded.
+        if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+            unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) };
+        }
+        if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+            unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024) };
+        }
+    }
     // Child-process modes for the webview windows (see login.rs / turnstile.rs).
     let mut args = std::env::args_os().skip(1);
     if let (Some(flag), Some(dir)) = (args.next(), args.next()) {
@@ -223,6 +240,7 @@ fn main() -> eframe::Result {
                 appicon::set_hwnd(h);
                 fullscreen::set_hwnd(h);
                 ui::set_titlebar_hwnd(h);
+                ui::set_mini_hwnd(h);
                 // eframe sets only the small icon; the taskbar button wants the big one.
                 appicon::set_window_icon(appicon::get(appicon::load(backend.data_dir())));
             }

@@ -309,7 +309,7 @@ impl App {
     /// Whether a video is what's on show for `t`: lyrics are timed to its song, so they
     /// don't go with it.
     pub(super) fn video_mode(&self, t: &Track) -> bool {
-        self.show_video && t.music_video && self.playing_as().is_none() && !self.jam.active()
+        self.show_video && t.has_video() && self.playing_as().is_none() && !self.jam.active()
     }
 
     /// From its video to its song version, at about the same place.
@@ -398,6 +398,12 @@ impl App {
             self.radio_pending = true;
             self.backend.request(Req::Radio { song_of: self.song_of(&t), seed: t.id });
         }
+    }
+
+    /// Every frame: a jam starting or ending changes it too. Normal in a jam, where
+    /// everyone hears the same song at the same moment.
+    pub(super) fn sync_tempo(&self) {
+        self.audio.set_speed(if self.jam.active() || !self.tempo_on { 1.0 } else { self.speed });
     }
 
     pub(crate) fn set_crossfade(&self) {

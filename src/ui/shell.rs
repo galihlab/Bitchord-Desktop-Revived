@@ -259,7 +259,7 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
     const LUCIDE: f32 = glyphs::LUCIDE_GLYPH;
     nav(ui, glyphs::SEARCH, APPLE, "Search", Page::Search(String::new()), matches!(p, Page::Search(_)), &mut go_to);
     nav(ui, glyphs::HOME, APPLE, "Home", Page::Home, p == Page::Home, &mut go_to);
-    nav(ui, glyphs::EXPLORE, APPLE, "New", Page::New, p == Page::New, &mut go_to);
+    nav(ui, glyphs::EXPLORE, APPLE, "New", Page::New, matches!(p, Page::New | Page::Mood(_)), &mut go_to);
     nav(ui, glyphs::LIBRARY, APPLE, "Library", Page::Library(LibTab::Playlists), matches!(p, Page::Library(_)), &mut go_to);
     nav(ui, glyphs::DOWNLOAD, APPLE, "Downloads", Page::Downloads, p == Page::Downloads, &mut go_to);
 
@@ -818,7 +818,8 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64, frosted: bool) {
     let narrow = cap.width() < 550.0;
     let pad = 16.0;
     let run_w = if narrow { 112.0 } else { 184.0 };
-    let right_w = 132.0;
+    // The speed button, when shown, takes a slot of its own at the right end.
+    let right_w = if app.tempo_on { 165.0 } else { 132.0 };
     let run_l = cap.left() + pad;
     let right_l = cap.right() - pad - right_w;
     let lcd_l = run_l + run_w + 8.0;
@@ -1032,12 +1033,15 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64, frosted: bool) {
         ui.painter().galley(pos2(text_r - g.size().x, cy + 2.0), g, col);
     }
 
-    // Right: favourite, lyrics, up next, volume. Hovering the volume slides a slider
-    // over the other three, as in the reference.
+    // Right: favourite, lyrics, up next, speed, volume. Hovering the volume slides a
+    // slider over the other three, as in the reference.
     let vol = app.audio.volume();
     let rslot = |i: usize| right_l + 21.0 + i as f32 * 33.0;
-    let vol_r = Rect::from_center_size(pos2(rslot(3), cy), Vec2::splat(28.0));
-    let slider = Rect::from_min_size(pos2(cap.right() - pad - 33.0 - 96.0, cy - 10.0), vec2(96.0, 20.0));
+    // With the speed button on, the volume moves a slot along and the speed takes its
+    // place, as in the reference's own order.
+    let vol_at = if app.tempo_on { 4 } else { 3 };
+    let vol_r = Rect::from_center_size(pos2(rslot(vol_at), cy), Vec2::splat(28.0));
+    let slider = Rect::from_min_size(pos2(vol_r.left() - 103.0, cy - 10.0), vec2(96.0, 20.0));
     let open_id = ui.scope_id().with("bar-vol");
     let was = ui.data(|d| d.get_temp::<bool>(open_id).unwrap_or(false));
     // Pointer position, not `rect_contains_pointer`: the window's own title-bar layers
@@ -1098,7 +1102,7 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64, frosted: bool) {
     } else {
         volume_slider(app, ui, slider, "bar");
     }
-    let r = rbtn(ui, 3, "vol", "Mute");
+    let r = rbtn(ui, vol_at, "vol", "Mute");
     let h = theme::anim_bool(&ctx, r.id.with("h"), r.hovered(), 0.15);
     // Three arcs, not two: the desktop app lights them a third at a time.
     let step = glyphs::volume_step(vol);
@@ -1118,6 +1122,12 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64, frosted: bool) {
             app.audio.set_volume(ui.data(|d| d.get_temp::<f32>(stash)).unwrap_or(0.6));
         }
     }
+    // The speed button, when the setting is on: the speed it's at, lit (with the dot
+    // under it) when it isn't 1×. Clicking opens a small card with its slider.
+    if app.tempo_on {
+        let resp = rbtn(ui, 3, "tempo", "Playback speed");
+        tempo_button(app, ui, resp, accent, cap.bottom());
+    }
 
     if total > 0.0
         && let Some(p) = sresp.interact_pointer_pos()
@@ -1130,6 +1140,70 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64, frosted: bool) {
             app.actions.push(Action::Seek(at(p)));
         }
     }
+}
+
+/// The player bar's speed button: the speed it's at, lit (with the dot under it) when
+/// it isn't 1×. Clicking opens a small card with its slider.
+fn tempo_button(app: &mut App, ui: &mut Ui, resp: egui::Response, accent: Color32, dot_floor: f32) {
+    let ctx = ui.ctx().clone();
+    let jam = app.jam.active();
+    let changed = !jam && (app.speed - 1.0).abs() > 0.001;
+    let r = resp.rect;
+    let h = theme::anim_bool(&ctx, resp.id.with("h"), resp.hovered(), 0.15);
+    if h > 0.0 {
+        ui.painter().rect_filled(r, r.height() / 2.0, theme::glass(0.10 * h));
+    }
+    let color = if changed { theme::text() } else { theme::lerp_color(theme::text_dim(), theme::text(), h) };
+    let speed = if jam { 1.0 } else { app.speed };
+    let g = widgets::galley(ui, &super::pages::times(speed), theme::semibold(12.5), color, 60.0);
+    ui.painter().galley(r.center() - g.size() / 2.0, g, color);
+    if changed {
+        ui.painter().circle_filled(pos2(r.center().x, (r.bottom() + 3.0).min(dot_floor)), 2.0, accent);
+    }
+    // A small card over the button: the speed, its slider under it.
+    egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        use crate::audio::tempo::{MAX_SPEED, MIN_SPEED};
+        ui.set_width(248.0);
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        ui.add_space(6.0);
+        let pad = 10.0;
+        if jam {
+            ui.horizontal(|ui| {
+                ui.add_space(pad);
+                ui.add(egui::Label::new(egui::RichText::new(super::pages::TEMPO_IN_JAM).font(theme::regular(12.5)).color(theme::text_dim())).wrap());
+            });
+            ui.add_space(6.0);
+        }
+        ui.add_enabled_ui(!jam, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(pad);
+                ui.label(egui::RichText::new("Speed").font(theme::semibold(13.5)).color(theme::text()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(pad);
+                    ui.label(egui::RichText::new(super::pages::times(speed)).font(theme::regular(13.0)).color(theme::text_dim()));
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(pad - 8.0);
+                super::pages::slider_track(ui, &mut app.speed, (MIN_SPEED, MAX_SPEED, 0.05), Some(1.0), ui.available_width() - pad + 8.0, "Speed");
+            });
+            // Always there, so the card keeps its size while the slider moves.
+            ui.add_space(5.0);
+            let (d, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+            ui.painter().rect_filled(d.shrink2(vec2(8.0, 0.0)), 0.0, theme::glass(0.08));
+            ui.add_space(5.0);
+            let normal = (app.speed - 1.0).abs() < 0.001;
+            ui.add_enabled_ui(!normal, |ui| {
+                if normal {
+                    ui.multiply_opacity(0.4);
+                }
+                if widgets::menu_action(ui, Some(icon::HISTORY), "Back to normal") {
+                    app.speed = 1.0;
+                }
+            });
+        });
+        ui.add_space(4.0);
+    });
 }
 
 /// The BitChord mark, white, fitted inside `r` (the sleeve slot when nothing plays).
@@ -1232,41 +1306,49 @@ fn playing_from(app: &mut App, ui: &mut Ui) {
     ui.add_space(8.0);
 }
 
-/// Current track plus everything after it. Shared by the drawer and now playing.
+/// The whole queue, scrolled to the current song when it changes: the songs already
+/// played are above it. Shared by the drawer and now playing.
 /// `bar_inset`: the strip at the right that stays clear of the rows, where the panel's
 /// scroll bar hugs the edge — so it never crosses the remove ✕ or the ⋯ menu, and a
 /// scrub down it doesn't light the rows' ✕ buttons up as it passes.
 pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str, bar_inset: f32) {
     let rows = super::pages::Rows::new(app, ui.input(|i| i.time));
-    egui::ScrollArea::vertical().id_salt(("queue", salt)).auto_shrink(false).show(ui, |ui| {
+    if app.queue.tracks.is_empty() {
+        ui.label(egui::RichText::new("Nothing queued yet").color(theme::text_dim()));
+        return;
+    }
+    let start = app.queue.index.unwrap_or(0);
+    // Above the list, so they stay in sight however far up it's scrolled.
+    playing_from(app, ui);
+    ui.checkbox(&mut app.autoplay, egui::RichText::new("Autoplay similar songs").color(theme::text_dim())).on_hover_cursor(egui::CursorIcon::PointingHand);
+    ui.add_space(6.0);
+    // A new current song (or a new queue) brings it back to the top of the list.
+    let mut area = egui::ScrollArea::vertical().id_salt(("queue", salt)).auto_shrink(false);
+    let shown = egui::Id::unique(("queue-at", salt));
+    let at = (app.queue.index, app.queue.current().map(|t| t.id.clone()));
+    if ui.data(|d| d.get_temp::<(Option<usize>, Option<String>)>(shown)).as_ref() != Some(&at) {
+        ui.data_mut(|d| d.insert_temp(shown, at));
+        let h = widgets::ROW_H + ui.spacing().item_spacing.y;
+        area = area.vertical_scroll_offset(start as f32 * h);
+    }
+    area.show(ui, |ui| {
         // The rows keep off the panel's edge by `bar_inset`, where the scroll bar hugs
         // the edge: it never crosses the remove ✕ or the ⋯ menu, and a scrub down it
         // doesn't light the rows' ✕ buttons up as it passes.
         let width = ui.max_rect().width() - bar_inset;
         ui.allocate_ui(vec2(width, 0.0), |ui| {
-            if app.queue.tracks.is_empty() {
-                ui.label(egui::RichText::new("Nothing queued yet").color(theme::text_dim()));
-                return;
-            }
-            let start = app.queue.index.unwrap_or(0);
-            playing_from(app, ui);
-            ui.checkbox(&mut app.autoplay, egui::RichText::new("Autoplay similar songs").color(theme::text_dim())).on_hover_cursor(egui::CursorIcon::PointingHand);
-            ui.add_space(6.0);
             let accent = app.accent_color();
             let (queue, liked, acts, has_current, by, drag) = (&app.queue.tracks, &app.liked, &mut app.actions, app.queue.index.is_some(), &app.jam.by, &mut app.row_drag);
             // Songs to come can be dragged into another order; in a jam, by the host.
             // Kept in app state, so it survives the rows' own ids (the list is
             // virtualized; a scrolled row hands its id to another).
             let (list, movable) = (egui::Id::unique(("queue", salt)), !app.jam.guest());
-            // Only the songs below the current one can be dragged to, so they're what
-            // it's measured from.
             let top = ui.cursor().top();
-            widgets::visible_rows(ui, queue.len() - start, |ui, k| {
-                let i = start + k;
+            // The whole queue: the songs already played stay above the one playing.
+            widgets::visible_rows(ui, queue.len(), |ui, i| {
                 let t = &queue[i];
-                // The first row is the current song.
-                let current = k == 0 && has_current;
-                if movable && !current {
+                let current = i == start && has_current;
+                if movable && (i > start || !has_current) {
                     row_drag::grip(ui, drag, list, i, t);
                 }
                 let o = widgets::RowOpts { current, added_by: by.get(&t.id).cloned(), hide_duration_hover: !current, ..rows.opts(liked, t, None, false) };
@@ -1276,7 +1358,7 @@ pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str, bar_inset: f32) {
                     acts.push(if current { Action::TogglePlay } else { Action::QueueJump(i) });
                 }
                 if !current && drag.is_none() && ui.rect_contains_pointer(Rect::from_min_max(resp.rect.min, pos2(resp.rect.right() + 42.0, resp.rect.bottom()))) {
-                    // The remove ✕, in the length's place — the length makes way for it
+                    // The remove ✗, in the length's place — the length makes way for it
                     // while the row is hovered (RowOpts::hide_duration_hover).
                     let x = Rect::from_center_size(resp.rect.right_center() - vec2(26.0, 0.0), Vec2::splat(28.0));
                     let xr = named(ui.interact(x, resp.id.with("rm"), Sense::click()), "Remove from queue").on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1288,7 +1370,7 @@ pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str, bar_inset: f32) {
                 }
             });
             let lowest = if has_current { start + 1 } else { start };
-            if let Some(d) = row_drag::feedback(ui, drag, list, row_drag::Rows { top, first: start, lowest, end: queue.len(), accent }) {
+            if let Some(d) = row_drag::feedback(ui, drag, list, row_drag::Rows { top, first: 0, lowest, end: queue.len(), accent }) {
                 // A gap becomes the insert index `move_track` takes: past the song it
                 // follows once the dragged one is out of the way.
                 let to = if d.gap > d.from { d.gap - 1 } else { d.gap };

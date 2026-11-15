@@ -98,6 +98,7 @@ pub fn spawn(site: Site, profile_dir: PathBuf, done: impl FnOnce(Outcome) + Send
             let res = std::env::current_exe().and_then(|exe| {
                 let mut cmd = std::process::Command::new(exe);
                 crate::proxy::pass_to(&mut cmd);
+                webkit_env(&mut cmd);
                 // WebKitGTK renders a blank page (or none) on some Linux drivers, NVIDIA
                 // and Wayland most of all, unless its accelerated path is switched off.
                 // The sign-in page needs no speed, so the safe path is always the one.
@@ -131,6 +132,16 @@ pub fn spawn(site: Site, profile_dir: PathBuf, done: impl FnOnce(Outcome) + Send
             })
         })
         .expect("spawn login thread");
+}
+
+/// For a webview window's process. WebKitGTK's DMA-BUF renderer draws nothing at all
+/// with NVIDIA's own driver on many cards, so the window stays blank: there it draws
+/// the older way. `WEBKIT_DISABLE_DMABUF_RENDERER=0` keeps it.
+pub fn webkit_env(cmd: &mut std::process::Command) {
+    const VAR: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+    if cfg!(target_os = "linux") && std::env::var_os(VAR).is_none() && std::path::Path::new("/proc/driver/nvidia/version").exists() {
+        cmd.env(VAR, "1");
+    }
 }
 
 /// Entry point of the child process: run the window and report on stdout.

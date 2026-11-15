@@ -6,6 +6,7 @@
 mod account;
 mod actions;
 mod collections;
+mod comments;
 mod dev;
 mod dialogs;
 mod glyphs;
@@ -27,6 +28,7 @@ mod responses;
 mod row_drag;
 mod shell;
 mod titlebar;
+pub use mini::set_hwnd as set_mini_hwnd;
 pub use titlebar::{custom as custom_titlebar, init as init_titlebar, set_hwnd as set_titlebar_hwnd};
 mod transfer;
 mod widgets;
@@ -57,6 +59,8 @@ pub use queue::Repeat;
 pub enum Page {
     Home,
     New,
+    /// A Moods & genres category, by its browse params.
+    Mood(String),
     Library(LibTab),
     Search(String),
     Downloads,
@@ -88,6 +92,7 @@ pub enum LibTab {
 pub enum NpTab {
     Lyrics,
     UpNext,
+    Comments,
     /// Neither panel: just the artwork.
     Art,
 }
@@ -390,6 +395,8 @@ pub struct App {
     home: Option<HomeState>,
     home_loading: bool,
     explore: Option<Explore>,
+    /// The Moods & genres category last opened.
+    mood: Option<crate::ytm::MoodPage>,
     search: Option<SearchResults>,
     /// Albums and playlists opened lately, so going back to one shows it at once (and
     /// refreshes it quietly), and their loads under way.
@@ -442,6 +449,8 @@ pub struct App {
     play_songs: bool,
     /// Show music videos moving, playing their own audio to stay in time.
     show_video: bool,
+    /// The tallest a music video plays at, one of [`VIDEO_QUALITIES`].
+    video_quality: u32,
     /// The video on show or on its way, by id.
     video: Option<(String, Option<crate::video::Player>)>,
     video_frame: Option<egui::TextureHandle>,
@@ -453,6 +462,8 @@ pub struct App {
     hide_explicit: bool,
     /// Podcast shows and episodes on Home, in search and in the library.
     show_podcasts: bool,
+    /// Now playing's Comments panel. Off by default.
+    show_comments: bool,
     /// With them, ask YouTube for its Restricted Mode too.
     restricted_mode: bool,
     /// The song version playing in place of the current music video.
@@ -565,6 +576,10 @@ pub struct App {
     eq_on: bool,
     eq_gains: crate::audio::eq::Gains,
     eq_no_clip: bool,
+    /// Playback speed: whether it's on (saved, and it puts a button in the player bar),
+    /// and the speed (not saved: 1× each launch).
+    tempo_on: bool,
+    speed: f32,
     /// The next song starts because this one is ending: crossfade into it.
     handoff: bool,
     /// The handoff just begun, for the play that starts the next song to pick up.
@@ -777,6 +792,7 @@ impl App {
         let restricted_mode = get("restricted_mode").is_some_and(|v| v == "1");
         backend.set_hide_explicit(hide_explicit, restricted_mode);
         let show_podcasts = get("podcasts").is_some_and(|v| v == "1");
+        let show_comments = get("comments").is_some_and(|v| v == "1");
         crate::ytm::set_podcasts(show_podcasts);
         // Before any request: a song started at launch must see the addon sources too.
         let hires_source = get("hires_source").unwrap_or_default();
@@ -880,6 +896,7 @@ impl App {
             home: None,
             home_loading: true,
             explore: None,
+            mood: None,
             search: None,
             lists: Lists::default(),
             artist: None,
@@ -914,6 +931,7 @@ impl App {
             high_quality: get("high_quality").is_none_or(|v| v == "1"),
             play_songs: get("play_songs").is_none_or(|v| v == "1"),
             show_video: dev_var("YTM_VIDEO").is_some() || get("show_video").is_some_and(|v| v == "1"),
+            video_quality: get("video_quality").and_then(|v| v.parse().ok()).filter(|h| VIDEO_QUALITIES.contains(h)).unwrap_or(720),
             video: None,
             video_frame: None,
             ambient_light: get("ambient_light").is_some_and(|v| v == "1"),
@@ -921,6 +939,7 @@ impl App {
             hide_search_videos: get("hide_search_videos").is_some_and(|v| v == "1"),
             hide_explicit,
             show_podcasts,
+            show_comments,
             restricted_mode,
             playing_as: None,
             output_device: get("output_device").filter(|d| !d.is_empty()).map(|id| (id, get("output_device_name").unwrap_or_default())),
@@ -1025,6 +1044,8 @@ impl App {
             eq_on: get("eq").is_some_and(|v| v == "1"),
             eq_gains: get("eq_gains").and_then(|v| parse_gains(&v)).unwrap_or_default(),
             eq_no_clip: get("eq_no_clip").is_none_or(|v| v == "1"),
+            tempo_on: get("tempo").is_some_and(|v| v == "1"),
+            speed: 1.0,
             segments: None,
             segment_skipped: f64::NEG_INFINITY,
             bg_time: 0.0,
@@ -1099,6 +1120,7 @@ impl App {
             Ok("transfer") => app.go(Page::Transfer),
             Ok("jam") => app.go(Page::Jam),
             Ok(p) if p.starts_with("album:") => app.go(Page::Album(p[6..].to_owned())),
+            Ok(p) if p.starts_with("mood:") => app.go(Page::Mood(p[5..].to_owned())),
             Ok(p) if p.starts_with("artist:") => app.go(Page::Artist(p[7..].to_owned())),
             Ok(p) if p.starts_with("playlist:") => app.go(Page::Playlist(p[9..].to_owned())),
             Ok(p) if p.starts_with("search:") => app.go(Page::Search(p[7..].to_owned())),
@@ -1115,6 +1137,13 @@ impl App {
         }
         if std::env::var("YTM_NOWPLAYING").is_ok() {
             app.np_open = true;
+        }
+        // Dev hook: YTM_NP_TAB=comments|upnext|art opens that panel.
+        match std::env::var("YTM_NP_TAB").as_deref() {
+            Ok("comments") => app.np_tab = NpTab::Comments,
+            Ok("upnext") => app.np_tab = NpTab::UpNext,
+            Ok("art") => app.np_tab = NpTab::Art,
+            _ => {}
         }
         app.jam.name = get("jam_name").unwrap_or_default();
         app.party.nickname = get("party_nickname").unwrap_or_default();
@@ -1217,6 +1246,7 @@ impl App {
                 Some(Req::Home(None))
             }
             Page::New => Some(Req::Explore(self.preferred_artist_ids())),
+            Page::Mood(p) if self.mood.as_ref().is_none_or(|m| &m.params != p) => Some(Req::Mood(p.clone())),
             // The empty search is the page's landing state: nothing to ask for.
             Page::Search(q) if !q.trim().is_empty() && self.search.as_ref().is_none_or(|s| &s.query != q) => Some(Req::Search(q.clone())),
             Page::Album(id) | Page::Playlist(id) => {
@@ -1240,6 +1270,7 @@ impl App {
         let cached = match &self.page {
             Page::Home => self.home.is_some(),
             Page::New => self.explore.is_some(),
+            Page::Mood(p) => self.mood.as_ref().is_some_and(|m| &m.params == p),
             Page::Album(id) | Page::Playlist(id) => self.opened(id).is_some(),
             Page::Artist(id) => self.artist.as_ref().is_some_and(|a| &a.id == id),
             Page::ArtistShelf { artist, title } => self.shelf.as_ref().is_some_and(|s| s.key == (artist.clone(), title.clone()) && !s.loading),
@@ -1578,6 +1609,7 @@ impl eframe::App for App {
         self.mini.tick(ctx, now);
         self.tray_window(ctx);
         self.window_hidden = self.hidden_to_tray || ctx.input(|i| i.viewport().minimized == Some(true));
+        self.sync_tempo();
         self.sync_discord();
         self.sync_lastfm();
         self.sync_server_queue(ctx, now);
@@ -1613,12 +1645,12 @@ impl eframe::App for App {
                 ctx.request_repaint_after(Duration::from_secs(2));
             }
         } else if self.np_open && playing && !self.mini.busy() {
-            ctx.request_repaint_after(Duration::from_millis(33));
+            pace::repaint_after(ctx, Duration::from_millis(33));
         } else if playing && widgets::equalizer_shown(ctx) {
             // The playing row's bars need a steady, full rate to read as smooth.
-            ctx.request_repaint_after(Duration::from_millis(16));
+            pace::repaint_after(ctx, Duration::from_millis(16));
         } else if playing && self.anim_bg && shell::pages_bg_moves(self.look()) {
-            ctx.request_repaint_after(Duration::from_millis(66));
+            pace::repaint_after(ctx, Duration::from_millis(66));
         } else if playing || self.buffering {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -1627,8 +1659,19 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.window_hidden {
+            // Hidden to the tray or minimized: nothing decodes for.
+            if self.video.take().is_some() {
+                self.video_frame = None;
+                self.glow = None;
+            }
             // Nothing shows while the window is hidden (tray, minimized).
             return;
+        }
+        // Picture in picture goes on with the video, on the way there and back included;
+        // the strip doesn't.
+        if self.mini.busy() && !mini::video_active() && self.video.take().is_some() {
+            self.video_frame = None;
+            self.glow = None;
         }
         self.shortcuts(&ctx);
         let now = ctx.input(|i| i.time);
@@ -1637,7 +1680,7 @@ impl eframe::App for App {
         self.sync_look();
         let look = self.look();
         // Now playing is dark; once it's most of the way up, so is the player bar under it.
-        let np = theme::anim_bool(&ctx, "np-open", self.np_open && self.current().is_some(), 0.42);
+        let np = theme::anim_bool_timed(&ctx, "np-open", self.np_open && self.current().is_some(), 0.42);
         let light = self.light_pages(&ctx) && np < 0.5 && !self.fullscreen;
         theme::set_mode(&ctx, light);
         if self.chrome_applied.as_deref() != Some(look.id.as_str()) {
@@ -1659,6 +1702,19 @@ impl eframe::App for App {
         dev::dev_memory(&ctx, now);
         dev::dev_probe(&ctx);
         let layout = self.mini.layout(&ctx);
+        // Picture in picture comes before the rest: the video fills the window, and the
+        // window keeps square corners.
+        if layout == mini::Layout::Mini && mini::video_active() {
+            crate::fullscreen::set_rounded(None);
+            mini::video_pip(self, ui, now);
+            // Any shape: by every edge and corner, unlike the strip.
+            titlebar::resize_edges(&ctx);
+            // "Sign in to like songs" and such: shown here too, not timed out unseen.
+            shell::toast(self, &ctx, now);
+            self.mini.fade_in(&ctx, now, Color32::BLACK);
+            dev_screenshot(&ctx, now);
+            return;
+        }
         // The strip's window is cut to the same corner as the artwork it frames; the
         // full window keeps its corners.
         crate::fullscreen::set_rounded((layout == mini::Layout::Mini).then(|| (theme::thumb_radius() + 1.0) * ctx.pixels_per_point()));
@@ -1829,10 +1885,12 @@ impl eframe::App for App {
         storage.set_string("high_quality", b(self.high_quality));
         storage.set_string("play_songs", b(self.play_songs));
         storage.set_string("show_video", b(self.show_video));
+        storage.set_string("video_quality", self.video_quality.to_string());
         storage.set_string("ambient_light", b(self.ambient_light));
         storage.set_string("hide_search_videos", b(self.hide_search_videos));
         storage.set_string("hide_explicit", b(self.hide_explicit));
         storage.set_string("podcasts", b(self.show_podcasts));
+        storage.set_string("comments", b(self.show_comments));
         storage.set_string("restricted_mode", b(self.restricted_mode));
         let folder = crate::downloads::folder();
         storage.set_string("download_dir", if folder == crate::downloads::default_folder() { String::new() } else { folder.display().to_string() });
@@ -1913,6 +1971,7 @@ impl eframe::App for App {
         storage.set_string("eq", b(self.eq_on));
         storage.set_string("eq_gains", self.eq_gains.map(|g| g.to_string()).join(","));
         storage.set_string("eq_no_clip", b(self.eq_no_clip));
+        storage.set_string("tempo", b(self.tempo_on));
         storage.set_string("show_roman", b(self.show_roman));
         storage.set_string("show_trans", b(self.show_trans));
         // Background test runs mustn't change the listener's sources or per-song picks.
@@ -1948,6 +2007,10 @@ impl eframe::App for App {
 }
 
 const SESSION_KEY: &str = "session";
+
+/// The heights offered for music videos. Decoding is on the CPU: 720p is easy, 1080p takes
+/// about three times as much.
+const VIDEO_QUALITIES: [u32; 4] = [1080, 720, 480, 360];
 
 /// Start this exe again once this process has saved and exited.
 fn relaunch() {

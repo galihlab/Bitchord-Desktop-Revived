@@ -44,6 +44,62 @@ pub async fn home_more(api: &Api, token: &str, auth: bool) -> anyhow::Result<Hom
     Ok(HomePage { chips: vec![], shelves: shelves(&sec["contents"]), continuation: continuation(sec) })
 }
 
+// --------------------------------------------------------------- moods & genres
+
+/// A group of Explore's Moods & genres ("Moods & moments", "Genres").
+pub struct MoodGroup {
+    pub title: String,
+    pub moods: Vec<Mood>,
+}
+
+/// One of its categories: its browse params, and the colour of its stripe (ARGB).
+pub struct Mood {
+    pub title: String,
+    pub params: String,
+    pub color: u32,
+}
+
+/// A category's page: shelves of playlists.
+pub struct MoodPage {
+    pub params: String,
+    pub title: String,
+    pub shelves: Vec<Shelf>,
+}
+
+pub async fn moods(api: &Api, auth: bool) -> anyhow::Result<Vec<MoodGroup>> {
+    Ok(parse_moods(&api.call("browse", json!({ "browseId": "FEmusic_moods_and_genres" }), auth).await?))
+}
+
+fn parse_moods(v: &Value) -> Vec<MoodGroup> {
+    let sec = &v["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"];
+    arr(&sec["contents"])
+        .iter()
+        .filter_map(|s| {
+            let g = &s["gridRenderer"];
+            let title = text(&g["header"]["gridHeaderRenderer"]["title"])?;
+            let moods: Vec<Mood> = arr(&g["items"])
+                .iter()
+                .filter_map(|i| {
+                    let b = &i["musicNavigationButtonRenderer"];
+                    let params = b["clickCommand"]["browseEndpoint"]["params"].as_str()?.to_owned();
+                    Some(Mood { title: text(&b["buttonText"])?, params, color: b["solid"]["leftStripeColor"].as_u64().unwrap_or(0) as u32 })
+                })
+                .collect();
+            (!moods.is_empty()).then_some(MoodGroup { title, moods })
+        })
+        .collect()
+}
+
+pub async fn mood(api: &Api, params: &str, auth: bool) -> anyhow::Result<MoodPage> {
+    let v = api.call("browse", json!({ "browseId": "FEmusic_moods_and_genres_category", "params": params }), auth).await?;
+    Ok(parse_mood(&v, params))
+}
+
+fn parse_mood(v: &Value, params: &str) -> MoodPage {
+    let sec = &v["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"];
+    MoodPage { params: params.to_owned(), title: text(&v["header"]["musicHeaderRenderer"]["title"]).unwrap_or_default(), shelves: shelves(&sec["contents"]) }
+}
+
 /// Whether podcasts are shown (Settings › Playback › Show podcasts). Off, the app is as
 /// it was before it knew of them: no Podcasts chip on Home, and shows and episodes are
 /// left out wherever YouTube Music lists them.
@@ -422,7 +478,7 @@ fn swap_songs(a: &mut Collection, videos: &[usize], songs: &[AlbumSong]) -> usiz
         let (Some(t), Some(s)) = (a.tracks.get_mut(i), songs.get(i)) else { continue };
         if t.id != s.id && same_title(&t.title, &s.title) {
             (t.id, t.duration) = (s.id.clone(), s.duration.or(t.duration));
-            t.music_video = false;
+            (t.music_video, t.video) = (false, false);
             swapped += 1;
         }
     }
@@ -772,6 +828,26 @@ fn discog_cards(v: &Value) -> Vec<Card> {
 /// Songs to play after `video_id` (its radio), at least `limit` when there are enough.
 /// A music video's radio is music videos only (a song's is songs): then those, rather
 /// than nothing. Its song's radio is the one to ask for.
+/// A song's first page of comments: its Comments tab (Up next, Lyrics, Comments, Related)
+/// holds the token for it. `None`: the song has comments turned off (the tab is then just
+/// a message) or has no such tab.
+pub async fn comments(api: &Api, video_id: &str, auth: bool) -> anyhow::Result<Option<Value>> {
+    let watch = api.call("next", json!({ "videoId": video_id }), auth).await?;
+    let tabs = &watch["contents"]["singleColumnMusicWatchNextResultsRenderer"]["tabbedRenderer"]["watchNextTabbedResultsRenderer"]["tabs"];
+    let tab = tabs.as_array().into_iter().flatten().find(|t| t["tabRenderer"]["title"] == "Comments");
+    let Some(token) = tab.and_then(|t| first_string(&t["tabRenderer"]["content"], "continuation")) else { return Ok(None) };
+    api.call("next", json!({ "continuation": token }), auth).await.map(Some)
+}
+
+/// The first string keyed `key` anywhere under `v`.
+fn first_string(v: &Value, key: &str) -> Option<String> {
+    match v {
+        Value::Object(m) => m.get(key).and_then(Value::as_str).map(str::to_owned).or_else(|| m.values().find_map(|x| first_string(x, key))),
+        Value::Array(a) => a.iter().find_map(|x| first_string(x, key)),
+        _ => None,
+    }
+}
+
 pub async fn radio(api: &Api, video_id: &str, auth: bool, limit: usize) -> anyhow::Result<Vec<Track>> {
     let body = json!({
         "playlistId": format!("RDAMVM{video_id}"),
@@ -1411,6 +1487,7 @@ fn two_row(r: &Value) -> Option<Card> {
             artists: artist_links(&r["subtitle"]),
             thumbs: thumbs.clone(),
             music_video: music_video(&[nav]),
+            video: has_video(&[nav]),
             explicit: explicit(&r["subtitleBadges"]),
             ..Default::default()
         })
@@ -1506,7 +1583,12 @@ fn is_video(item: &Value) -> bool {
     // Only where the item itself plays: a playlist card can hold its first video's type too.
     let (two, row) = (&item["musicTwoRowItemRenderer"], &item["musicResponsiveListItemRenderer"]);
     let own = [&two["navigationEndpoint"], &row["overlay"], &row["flexColumns"][0], &item["navigationEndpoint"]];
-    matches!(video_type(&own), Some("MUSIC_VIDEO_TYPE_OMV" | "MUSIC_VIDEO_TYPE_UGC" | "MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC"))
+    has_video(&own)
+}
+
+/// A video of any kind (an official music video, a channel's upload), not a song.
+fn has_video(parts: &[&Value]) -> bool {
+    matches!(video_type(parts), Some("MUSIC_VIDEO_TYPE_OMV" | "MUSIC_VIDEO_TYPE_UGC" | "MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC"))
 }
 
 /// The first `musicVideoType` under these parts of an item.
@@ -1583,8 +1665,9 @@ fn list_item(r: &Value) -> Option<Track> {
         duration = Some(d);
     }
     let track_nr = text(&r["index"]).and_then(|n| n.parse().ok());
-    let music_video = music_video(&[&r["overlay"], &r["flexColumns"][0]]);
-    Some(Track { id, title, artists, album, duration, thumbs: thumbs(&r["thumbnail"]["musicThumbnailRenderer"]), track_nr, plays, music_video, explicit: explicit(&r["badges"]) })
+    let parts = [&r["overlay"], &r["flexColumns"][0]];
+    let (music_video, video) = (music_video(&parts), has_video(&parts));
+    Some(Track { id, title, artists, album, duration, thumbs: thumbs(&r["thumbnail"]["musicThumbnailRenderer"]), track_nr, plays, music_video, video, explicit: explicit(&r["badges"]) })
 }
 
 /// A song in a radio / up-next panel.
@@ -1611,6 +1694,7 @@ fn panel_item(r: &Value) -> Option<Track> {
         track_nr: None,
         plays: None,
         music_video: music_video(&[&r["navigationEndpoint"]]),
+        video: has_video(&[&r["navigationEndpoint"]]),
         explicit: explicit(&r["badges"]),
     })
 }
@@ -1820,6 +1904,28 @@ fn inner_text(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moods_and_genres_are_read_with_their_categories() {
+        let button = |name: &str, params: &str| json!({"musicNavigationButtonRenderer": {"buttonText": {"runs": [{"text": name}]}, "solid": {"leftStripeColor": 4288988671u64},
+            "clickCommand": {"browseEndpoint": {"browseId": "FEmusic_moods_and_genres_category", "params": params}}}});
+        let grid = |title: &str, items: Vec<Value>| json!({"gridRenderer": {"header": {"gridHeaderRenderer": {"title": {"runs": [{"text": title}]}}}, "items": items}});
+        let v = json!({"contents": {"singleColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [
+            grid("Moods & moments", vec![button("Chill", "p1"), button("Focus", "p2")]),
+            grid("Genres", vec![button("Rock", "p3")]),
+            grid("Empty", vec![]),
+        ]}}}}]}}});
+        let groups = super::parse_moods(&v);
+        assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), ["Moods & moments", "Genres"]);
+        assert_eq!((groups[0].moods[1].title.as_str(), groups[0].moods[1].params.as_str(), groups[0].moods[1].color), ("Focus", "p2", 0xFFA4_C5FF));
+        let page = json!({"header": {"musicHeaderRenderer": {"title": {"runs": [{"text": "Chill"}]}}},
+            "contents": {"singleColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [
+                {"musicCarouselShelfRenderer": {"header": {"musicCarouselShelfBasicHeaderRenderer": {"title": {"runs": [{"text": "Coffee shop blends"}]}}},
+                    "contents": [{"musicTwoRowItemRenderer": {"title": {"runs": [{"text": "Mellow"}]}, "navigationEndpoint": {"browseEndpoint": {"browseId": "VLRDCLAK5uy_x", "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_PLAYLIST"}}}}}}]}}
+            ]}}}}]}}});
+        let m = super::parse_mood(&page, "p1");
+        assert_eq!((m.title.as_str(), m.shelves.len(), m.shelves[0].title.as_str()), ("Chill", 1, "Coffee shop blends"));
+    }
 
     /// An `accountItem` as the account switcher lists it.
     fn account_item(name: &str, handle: Option<&str>, selected: bool, page: Option<&str>, datasync: &str) -> Value {
@@ -2350,6 +2456,9 @@ mod tests {
         assert!(!row("MUSIC_VIDEO_TYPE_ATV"));
         // User uploads and covers have no song version to look for.
         assert!(!row("MUSIC_VIDEO_TYPE_UGC"));
+        // They're still videos to show.
+        let video = |kind: &str| list_item(&album_row("x", "Song", kind)["musicResponsiveListItemRenderer"]).unwrap().video;
+        assert!(video("MUSIC_VIDEO_TYPE_OMV") && video("MUSIC_VIDEO_TYPE_UGC") && !video("MUSIC_VIDEO_TYPE_ATV"));
     }
 
     /// A signed-out search for the songs of a few music videos. Run alone:

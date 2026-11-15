@@ -93,9 +93,9 @@ impl Prefs {
             // 70% out of the box: the theme's own size reads large on most screens, and
             // the + button is right there for anyone who wants it bigger.
             text_scale: get("lyric_scale").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.7).clamp(TEXT_SCALE.0, TEXT_SCALE.1),
-            // Intensive glow is on out of the box at 70%: new listeners get the am-lyrics
-            // look at once, and turning it off is one switch.
-            glow_boost: get("lyric_glow").map(|v| v == "1").unwrap_or(true),
+            // Intensive glow is off out of the box: the theme's own glow stands on its
+            // own, and one switch turns the am-lyrics look on.
+            glow_boost: get("lyric_glow").map(|v| v == "1").unwrap_or(false),
             glow_strength: get("lyric_glow_strength").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.7).clamp(GLOW_STRENGTH.0, GLOW_STRENGTH.1),
             song_offsets: get("lyric_song_offsets").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
             pins: get("lyric_pins")
@@ -188,12 +188,13 @@ pub struct Clock {
 }
 
 impl Clock {
-    pub fn tick(&mut self, pos: f64, playing: bool, now: f64) -> f64 {
+    /// `speed`: how much song goes by each second.
+    pub fn tick(&mut self, pos: f64, playing: bool, now: f64, speed: f64) -> f64 {
         if !playing || !self.playing || self.wall == 0.0 {
             self.shown = pos;
         } else {
             let dt = (now - self.wall).max(0.0);
-            let predicted = self.shown + dt;
+            let predicted = self.shown + dt * speed;
             let err = pos - predicted;
             if err.abs() > 0.25 {
                 self.shown = pos;
@@ -278,11 +279,24 @@ mod tests {
     #[test]
     fn clock_never_steps_back_while_playing() {
         let mut c = Clock::default();
-        let a = c.tick(10.0, true, 100.0);
-        let b = c.tick(10.0, true, 100.016);
-        let d = c.tick(9.99, true, 100.032);
+        let a = c.tick(10.0, true, 100.0, 1.0);
+        let b = c.tick(10.0, true, 100.016, 1.0);
+        let d = c.tick(9.99, true, 100.032, 1.0);
         assert!(b >= a && d >= b);
         // A seek snaps.
-        assert_eq!(c.tick(50.0, true, 100.05), 50.0);
+        assert_eq!(c.tick(50.0, true, 100.05, 1.0), 50.0);
+    }
+
+    #[test]
+    fn clock_keeps_up_when_sped_up() {
+        let mut c = Clock::default();
+        let dt = 1.0 / 60.0;
+        let mut shown = 0.0;
+        for i in 0..600 {
+            let t = i as f64 * dt;
+            shown = c.tick(10.0 + t * 2.0, true, 100.0 + t, 2.0);
+        }
+        let pos = 10.0 + 599.0 * dt * 2.0;
+        assert!((pos - shown).abs() < 0.005, "{}", pos - shown);
     }
 }

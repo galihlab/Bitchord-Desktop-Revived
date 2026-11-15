@@ -9,7 +9,7 @@
 
 #define AppName "BitChord"
 #ifndef AppVersion
-#define AppVersion "2.0.2-galihlab.1"
+#define AppVersion "2.0.2-galihlab.2"
 #endif
 #define AppExe "bitchord.exe"
 #ifdef Arm64

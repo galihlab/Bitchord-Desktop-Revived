@@ -25,6 +25,9 @@ static LINK_RESULT: std::sync::Mutex<Option<Result<(String, Option<crate::discor
 impl App {
     pub(super) fn set_discord_enabled(&mut self, enabled: bool) {
         self.discord_enabled = enabled;
+        if !enabled {
+            self.discord_artwork.allow_publish(false);
+        }
         if enabled {
             // A linked account publishes presence through the account's own gateway;
             // without one, the plain IPC client (the app id's card) does it.
@@ -46,55 +49,189 @@ impl App {
         }
     }
 
-    /// Mirror playback into Discord. Cheap enough to run every frame: it only sends on a
-    /// new song, play/pause, a seek, or a newly learned duration.
-    pub(super) fn sync_discord(&mut self) {
+    /// A notification when a new song starts while the window is hidden, minimized or
+    /// behind other windows (the mini player on show counts as seen). Not for the song
+    /// picked in the app, nor the same song again (Repeat one).
+    pub(super) fn sync_song_notification(&mut self, ctx: &egui::Context) {
+        if !self.song_notifications || !self.playing() || self.buffering || !crate::notify::available() {
+            return;
+        }
+        if self.notified.as_ref().is_some_and(|(g, _)| *g == self.generation) {
+            return;
+        }
+        let Some(t) = self.current().cloned() else { return };
+        let again = self.notified.as_ref().is_some_and(|(_, id)| *id == t.id);
+        self.notified = Some((self.generation, t.id.clone()));
+        let focused = ctx.input(|i| i.viewport().focused) != Some(false);
+        let seen = !self.window_hidden && (focused || self.mini.showing());
+        if again || seen {
+            return;
+        }
+        if self.notifier.is_none() {
+            self.notifier = crate::notify::Notifier::spawn();
+        }
+        let Some(n) = self.notifier.clone() else { return };
+        let song = crate::notify::Song {
+            title: t.title.clone(),
+            artist: t.artist_line(),
+            cover: None,
+        };
+        // A local song's cover is a file already; there's nothing to download for it.
+        let local = crate::local::cover_file(&t.id);
+        let (art, id, generation) = (backend::art_url(&t), t.id, self.generation);
+        n.expect(generation);
+        let dir = self.backend.data_dir().join("notification-cover");
+        let http = self.backend.http();
+        self.backend.spawn(async move {
+            let cover = match local {
+                Some(file) => Some(file),
+                None => match art {
+                    Some(url) => async {
+                        let bytes = http.get(&url).timeout(Duration::from_secs(5)).send().await?.error_for_status()?.bytes().await?;
+                        // A new name per song: Windows keeps showing an older picture by its path.
+                        let _ = std::fs::remove_dir_all(&dir);
+                        std::fs::create_dir_all(&dir)?;
+                        let path = dir.join(format!("{id}.jpg"));
+                        std::fs::write(&path, &bytes)?;
+                        anyhow::Ok(path)
+                    }
+                    .await
+                    .inspect_err(|e| log::debug!("notification cover: {e:#}"))
+                    .ok(),
+                    None => None,
+                },
+            };
+            n.show(generation, crate::notify::Song { cover, ..song });
+        });
+    }
+
+    /// What's playing, as Discord would get it, paused or not.
+    pub(super) fn discord_presence(&self) -> Option<crate::discord::Presence> {
+        if self.discord_finished == Some(self.generation) && self.resume_at.is_none() {
+            return None;
+        }
+        let t = self.playing_track()?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        // In real time: a song at 2x is over in half its length.
+        let speed = self.audio.status.speed().max(0.1);
+        let seek = self.audio.status.seek_revision.load(Ordering::Acquire);
+        let paused = !self.playing() || self.buffering;
+        let position = if paused { self.audio.status.position() } else { self.audio.status.position_smooth() };
+        let position_ms = position.as_millis() as u64;
+        let duration_ms = match self.audio.status.duration_ms.load(Ordering::Relaxed) {
+            0 => t.duration.map_or(0, |d| u64::from(d) * 1000),
+            value => value,
+        };
+        let start_ms = now - (position_ms as f64 / f64::from(speed)) as i64;
+        let dur = (duration_ms as f64 / f64::from(speed)) as i64;
+        // The stream's own sample rate can differ from the audio device's output rate.
+        // The line says the tier, the bitrate and the rate: the stream's measured
+        // numbers when the decoder reported them, the addon's own when it's the
+        // source of truth, and the tier off the addon's info — a plain YouTube
+        // stream has none, so it plays as High.
+        let stats = self.stream_stats.as_ref().filter(|(g, _)| *g == self.generation).map(|(_, s)| s);
+        let info = self.audio_info.as_ref().filter(|(g, _)| *g == self.generation).map(|(_, i)| i);
+        let quality = match (stats, info) {
+            (Some(s), Some(i)) => Some(crate::discord::quality_summary(i.tier(), s.bitrate_kbps, Some(s.sample_rate))),
+            (Some(s), None) => Some(crate::discord::quality_summary("High", s.bitrate_kbps, Some(s.sample_rate))),
+            (None, Some(i)) => Some(crate::discord::quality_summary(i.tier(), i.bitrate_kbps, i.sample_rate)),
+            (None, None) => Some("High".to_owned()),
+        };
+        let code = self.jam.code();
+        Some(crate::discord::Presence {
+            video_id: t.id.clone(),
+            title: t.title.clone(),
+            artist: t.artist_line(),
+            artist_id: t.first_artist_id().map(str::to_owned),
+            album: t.album.as_ref().map(|a| a.name.clone()),
+            album_id: t.album.as_ref().and_then(|a| a.id.clone()),
+            art: backend::art_url(t),
+            artist_art: self
+                .artist
+                .as_ref()
+                .filter(|a| Some(a.id.as_str()) == t.first_artist_id())
+                .and_then(|a| crate::model::pick(&a.banner, 160))
+                .map(|u| crate::model::sized(u, 512)),
+            quality,
+            start_ms,
+            end_ms: (dur > 0).then_some(start_ms + dur),
+            paused,
+            duration_ms,
+            position_ms,
+            clock: (self.generation, seek, speed.to_bits()),
+            jam: (!code.is_empty()).then(|| crate::jam::share_link(&self.jam_server, &code)),
+        })
+    }
+
+    /// Mirror playback into Discord. Cheap enough to run every frame: it only sends when
+    /// the card would look different, as on a new song, play/pause, a seek or new settings.
+    /// A linked account gets the card through its own gateway; a listener who never
+    /// linked one gets the plain IPC card — both laid out by the same wording.
+    pub(super) fn sync_discord(&mut self, ctx: &egui::Context) {
         if !self.discord_enabled {
             return;
         }
-        // A saved link comes back as a service on the first frame; the plain IPC
-        // one stays for a listener who never linked Discord.
+        // A saved link comes back as a service on the first frame.
         if self.discord_link.is_none() && self.discord_link_token.is_some() {
             self.discord_link = Some(Arc::new(crate::discord_link::Service::new(&self.backend)));
         }
-        // The linked account's card goes through the account's own gateway; the plain
-        // IPC one stays for a listener who never linked Discord.
         let linked = self.discord_link.is_some() && self.discord_link_token.is_some();
         if !linked && self.discord.is_none() {
             return;
         }
-        let track = self.playing_track().filter(|_| self.playing() && !self.buffering);
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-        // In real time: a song at 2x is over in half its length.
-        let speed = self.audio.status.speed() as f64;
-        let start_ms = now - (self.audio.status.position().as_millis() as f64 / speed) as i64;
-        let dur = (self.audio.status.duration_ms.load(Ordering::Relaxed) as f64 / speed) as i64;
-        // Position ticks every 100 ms; only a jump of 2 s or more is a real seek.
-        let same = match (track, &self.discord_sent) {
-            (Some(t), Some(b)) => b.video_id == t.id && (start_ms - b.start_ms).abs() < 2000 && b.end_ms.map_or(dur <= 0, |e| (e - (start_ms + dur)).abs() < 2000),
-            (None, None) => true,
-            _ => false,
-        };
-        if same {
-            return;
+        let now = std::time::Instant::now();
+        let prefs = &self.discord_prefs;
+        if self.discord_edit.as_ref().is_none_or(|(wanted, _)| wanted != prefs) {
+            self.discord_edit = Some((prefs.clone(), now));
         }
-        let want = track.map(|t| crate::discord::Presence {
-            video_id: t.id.clone(),
-            title: t.title.clone(),
-            artist: t.artist_line(),
-            album: t.album.as_ref().map(|a| a.name.clone()),
-            art: backend::art_url(t),
-            start_ms,
-            end_ms: (dur > 0).then_some(start_ms + dur),
+        let (wanted, edited) = self.discord_edit.as_ref().expect("settings were sampled above");
+        let settle = std::time::Duration::from_millis(600).saturating_sub(now.duration_since(*edited));
+        let applied = self.discord_applied.get_or_insert_with(|| wanted.clone());
+        if applied != wanted {
+            if settle.is_zero()
+                || wanted.hide_details != applied.hide_details
+                || wanted.when_paused != applied.when_paused
+                || (applied.artwork.host && !wanted.artwork.host)
+            {
+                applied.clone_from(wanted);
+            } else {
+                ctx.request_repaint_after(settle);
+            }
+        }
+        let prefs = self.discord_applied.as_ref().expect("settings were applied above");
+        let presence = self.discord_presence().filter(|p| !p.paused || prefs.when_paused);
+        self.discord_artwork.allow_publish(presence.is_some() && !prefs.hide_details && prefs.art && prefs.artwork.host);
+        let want = presence.map(|p| {
+            let artwork = self.discord_artwork.pictures(&self.backend, &p, prefs, self.playing_track(), false);
+            crate::discord::Card::new(&p, prefs, artwork)
         });
-        if linked {
-            let link = self.discord_link.as_ref().expect("checked above").clone();
-            let token = self.discord_link_token.clone().expect("checked above");
-            link.set_presence(token, want.clone(), self.discord_options.clone(), 1.0);
-        } else if let Some(d) = &self.discord {
-            d.set(want.clone());
+        let same = match (&want, &self.discord_sent) {
+            (Some(a), Some(b)) => a.same(b, false),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        if !same {
+            let badge_progress = want.as_ref().zip(self.discord_sent.as_ref()).is_some_and(|(a, b)| a.same(b, true));
+            let delay = self.discord_updates.delay(now, prefs.refresh_seconds, badge_progress);
+            let hiding = want.is_none()
+                || (prefs.hide_details
+                    && self
+                        .discord_sent
+                        .as_ref()
+                        .is_some_and(|c| c.lines.iter().any(Option::is_some) || c.annotation.is_some() || c.art.is_some() || !c.buttons.is_empty() || c.times.is_some()));
+            if !hiding && !delay.is_zero() {
+                ctx.request_repaint_after(delay);
+                return;
+            }
+            self.discord_updates.record(now);
+            if linked {
+                let link = self.discord_link.as_ref().expect("checked above").clone();
+                let token = self.discord_link_token.clone().expect("checked above");
+                link.set_presence(token, want.clone());
+            } else if let Some(d) = &self.discord {
+                d.set(want.clone());
+            }
+            self.discord_sent = want;
         }
-        self.discord_sent = want;
     }
 
     /// Connect Discord: the sign-in window opens discord.com; the token it hides
@@ -170,7 +307,8 @@ impl App {
         if self.lastfm_user.is_none() {
             return;
         }
-        let Some(t) = self.playing_track().filter(|_| self.playing() && !self.buffering) else { return };
+        // A song's music video picked on its switch is still that song.
+        let Some(t) = self.heard_song().filter(|_| self.playing() && !self.buffering) else { return };
         let pos = self.audio.status.position();
         let dur = Duration::from_millis(self.audio.status.duration_ms.load(Ordering::Relaxed));
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
@@ -300,7 +438,7 @@ impl App {
     /// the shell can accept it and then never display it (taskbar replacements, a
     /// busy tray cache); and if the icon can't be had at all, a close just quits
     /// instead of hiding.
-    pub(super) fn tray_window(&mut self, ctx: &egui::Context) {
+    pub(super) fn tray_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         // Shells mid-refresh have been seen to drop a single show request: keep
         // re-asserting it for a few frames, focus last, once. (Before the early
         // returns below: after a show, `hidden_to_tray` is false and the rest of
@@ -321,7 +459,7 @@ impl App {
         // The icon, from the first frame on (--no-tray sessions never get one).
         // A failed registration isn't retried every frame; the next try comes at
         // the re-register interval.
-        if self.tray.is_none() && !self.tray_off && !self.exiting && self.tray_retry_at.is_none_or(|t| t.elapsed() >= TRAY_REREGISTER) {
+        if self.tray.is_none() && !self.tray_off && !self.exiting && self.tray_error.is_none() && self.tray_retry_at.is_none_or(|t| t.elapsed() >= TRAY_REREGISTER) {
             let c = ctx.clone();
             match crate::tray::Tray::new(crate::appicon::get(self.app_icon), self.playing() || self.buffering, crate::autostart::enabled(), move || c.request_repaint()) {
                 Ok(t) => {
@@ -332,17 +470,22 @@ impl App {
                 }
                 Err(e) => {
                     log::warn!("tray icon unavailable: {e:#}");
-                    self.tray_retry_at = Some(std::time::Instant::now());
+                    if let Some(u) = e.downcast_ref::<crate::tray::Unsupported>() {
+                        // It can't work here: no retries, and the reason shows under the
+                        // setting. Without an icon there'd be no way back: × just closes.
+                        self.tray_error = Some(u.0.clone());
+                    } else {
+                        self.tray_retry_at = Some(std::time::Instant::now());
+                    }
                 }
             }
         }
-        // The tray's Play/Pause label follows the player; it only changes with it.
+        // The menu shows the song, with Play/Pause, Next and Previous under it, and
+        // hovering the icon shows the song too; they follow the player.
         let playing = self.playing() || self.buffering;
-        if self.tray.is_some() && self.tray_play != Some(playing) {
-            if let Some(t) = &self.tray {
-                t.set_play(playing);
-            }
-            self.tray_play = Some(playing);
+        let song = self.current().map(|t| (t.title.clone(), t.artist_line()));
+        if let Some(t) = &mut self.tray {
+            t.set_now(song.as_ref().map(|(title, artist)| (title.as_str(), artist.as_str())), playing);
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.close_to_tray && !self.exiting {
             // A real click on × needs the app to have been up for a moment. The
@@ -388,7 +531,7 @@ impl App {
         // The tray's clicks, handled like the keyboard's own transport keys.
         for cmd in crate::tray::take() {
             match cmd {
-                crate::tray::Cmd::Show => self.show_window(ctx),
+                crate::tray::Cmd::Show => self.bring_back(ctx, is_wayland(frame)),
                 crate::tray::Cmd::PlayPause => self.toggle(),
                 crate::tray::Cmd::Next => self.next(),
                 crate::tray::Cmd::Prev => self.prev(),
@@ -403,6 +546,16 @@ impl App {
                     break;
                 }
             }
+        }
+    }
+
+    /// The window back for the tray's Show or a later launch. Wayland ignores Visible,
+    /// un-minimizing and Focus, so there it can only ask for attention (see `tray_window`).
+    pub(super) fn bring_back(&mut self, ctx: &egui::Context, wayland: bool) {
+        if wayland {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        } else {
+            self.show_window(ctx);
         }
     }
 
@@ -444,4 +597,10 @@ impl App {
             }
         });
     }
+}
+
+/// Whether the window runs under Wayland (it can't be raised or focused there).
+pub(super) fn is_wayland(frame: &eframe::Frame) -> bool {
+    use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+    frame.display_handle().is_ok_and(|h| matches!(h.as_raw(), RawDisplayHandle::Wayland(_)))
 }

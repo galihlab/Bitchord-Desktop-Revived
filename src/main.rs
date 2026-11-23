@@ -12,8 +12,10 @@ mod art;
 mod audio;
 mod backend;
 mod bidi;
+mod cache;
 mod deeplink;
 mod discord;
+mod discord_artwork;
 mod discord_link;
 mod dash;
 mod downloads;
@@ -23,17 +25,22 @@ mod jam;
 mod innertube;
 mod jsc;
 mod lastfm;
+mod listening;
+mod local;
 mod logging;
 mod login;
 mod lyrics;
 mod media;
 mod model;
 mod motion;
+mod notify;
 mod opus;
 mod party;
 mod preset;
 mod providers;
+mod recommend;
 mod shader;
+mod sources;
 mod sponsorblock;
 mod stream;
 mod theme;
@@ -131,6 +138,7 @@ fn main() -> eframe::Result {
         deeplink::push(code);
     }
     logging::init(&data_dir());
+    guard_settings(&data_dir());
     if show_requested {
         if claim.busy() {
             // The holder was there but didn't answer; `take_over` has the channel now.
@@ -155,6 +163,11 @@ fn main() -> eframe::Result {
         // Windows, and Linux where the desktop draws none: the app draws its own title
         // bar (see `ui::titlebar`).
         .with_decorations(!ui::custom_titlebar())
+        // macOS: its frame, without its title strip; the traffic lights go on the app's
+        // top row (see `ui::titlebar`).
+        .with_fullsize_content_view(ui::titlebar_inset())
+        .with_titlebar_shown(!ui::titlebar_inset())
+        .with_title_shown(!ui::titlebar_inset())
         .with_icon(appicon::get(appicon::load(&data_dir())).icon_data().expect("bundled icons are valid PNGs"));
     if background {
         viewport = viewport.with_position([-4000.0, 0.0]).with_inner_size([1920.0, 1057.0]).with_active(false).with_taskbar(false);
@@ -204,6 +217,11 @@ fn main() -> eframe::Result {
             // Jam links from later launches arrive over the channel claimed at startup:
             // this is where their wake-up meets the UI.
             deeplink::set_wake(Arc::new(move || wake()));
+            // Before the first frame, which then draws in the desktop's light or dark style.
+            #[cfg(target_os = "linux")]
+            theme::follow_system_scheme(wake);
+            // Whether song notifications can show here (Windows: a Start menu entry).
+            notify::look_up();
             // Keep `ytm-rs:` links pointing at this copy; dev builds leave it alone
             // (even with YTM_UPDATE_FORCE).
             if update::installed() && !cfg!(debug_assertions) {
@@ -244,7 +262,13 @@ fn main() -> eframe::Result {
                 // eframe sets only the small icon; the taskbar button wants the big one.
                 appicon::set_window_icon(appicon::get(appicon::load(backend.data_dir())));
             }
-            let media = media::Media::new(hwnd(cc), media_tx, wake);
+            #[cfg(target_os = "macos")]
+            if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(cc)
+                && let raw_window_handle::RawWindowHandle::AppKit(h) = h.as_raw()
+            {
+                ui::set_titlebar_view(h.ns_view.as_ptr());
+            }
+            let media = media::Media::new(hwnd(cc), media_tx, media::Direct::new(audio.clone()), wake);
 
             // Which GL driver this is, for reports of drawing problems (Windows on ARM runs
             // GL through Mesa's D3D12 layer).
@@ -313,4 +337,27 @@ fn data_dir() -> std::path::PathBuf {
         return dir.join("data");
     }
     directories::ProjectDirs::from("", "", "ytm-rs").expect("no home directory").data_dir().to_path_buf()
+}
+
+/// eframe reads an unparsable `app.ron` as no settings at all, and its next save
+/// overwrites what's left — a kill mid-write (the updater's installer asking the app
+/// to close, a power cut) shows up at the next launch as every setting wiped. So the
+/// file is kept one good copy deep: a copy that parses is backed up, a copy that
+/// doesn't is set aside and the backup takes its place, before eframe ever opens it.
+/// The half-written copy stays as `app.ron.bad` for anyone who wants it back.
+pub(crate) fn guard_settings(dir: &std::path::Path) {
+    use std::io::BufReader;
+    let path = dir.join("app.ron");
+    let Ok(file) = std::fs::File::open(&path) else { return };
+    let reads = ron::de::from_reader::<_, std::collections::HashMap<String, String>>(BufReader::new(file)).is_ok();
+    if reads {
+        let _ = std::fs::copy(&path, dir.join("app.ron.bak"));
+        return;
+    }
+    log::warn!("settings: {} is unreadable; setting it aside", path.display());
+    let _ = std::fs::rename(&path, dir.join("app.ron.bad"));
+    let bak = dir.join("app.ron.bak");
+    if std::fs::copy(&bak, &path).is_ok() {
+        log::info!("settings: restored the last good copy");
+    }
 }

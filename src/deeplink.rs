@@ -185,91 +185,153 @@ fn channel_id() -> String {
     name
 }
 
+/// Where the Unix socket lives: `$XDG_RUNTIME_DIR`, else a directory of our own in the
+/// temp dir. Empty or relative counts as unset: either would put the socket in the
+/// working directory. (`has_root` is the same as absolute on Unix, and testable on Windows.)
+#[cfg_attr(windows, allow(dead_code))]
+fn runtime_dir(xdg: Option<std::ffi::OsString>, tmp: &std::path::Path, uid: u32) -> std::path::PathBuf {
+    match xdg.map(std::path::PathBuf::from) {
+        Some(dir) if dir.has_root() => dir,
+        _ => tmp.join(format!("bitchord-{uid}")),
+    }
+}
+
 #[cfg(not(windows))]
 mod unix {
-    use std::io::{ErrorKind, Read};
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
 
     use super::channel_id;
 
-    /// Per-user socket, in the user's runtime dir (`/tmp` with their uid, else).
-    pub fn socket_path() -> PathBuf {
+    /// The socket's directory, or None if it isn't this user's alone. Anyone can create
+    /// files in `/tmp`: a socket another user put there would take our launches (and
+    /// invites), and the app would never open.
+    fn dir() -> Option<PathBuf> {
         let uid = unsafe { libc::getuid() };
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        let name = if dir == PathBuf::from("/tmp") { format!("{}-{}", uid, channel_id()) } else { channel_id() };
-        dir.join(format!("{name}.sock"))
+        let dir = super::runtime_dir(std::env::var_os("XDG_RUNTIME_DIR"), &std::env::temp_dir(), uid);
+        // The temp-dir fallback may not exist yet. If it does, the check below decides.
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        match private_dir(&dir, uid) {
+            Ok(()) => Some(dir),
+            Err(e) => {
+                log::warn!("single-instance socket: {}: {e}", dir.display());
+                None
+            }
+        }
     }
 
-    /// Take the channel (bind and serve) or find it taken. A socket file left behind by
-    /// a copy that died without cleaning up binds as taken too; the caller notices when
-    /// nothing answers and asks [`super::take_over`].
+    /// A real directory (not a link) owned by `uid`, that no one else can get into.
+    pub(super) fn private_dir(dir: &Path, uid: u32) -> std::io::Result<()> {
+        let meta = std::fs::symlink_metadata(dir)?;
+        if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+            return Err(std::io::Error::other("not a private directory of this user"));
+        }
+        Ok(())
+    }
+
+    /// The socket and its lock file in `dir`.
+    pub(super) fn paths(dir: &Path) -> (PathBuf, PathBuf) {
+        let name = channel_id();
+        (dir.join(format!("{name}.sock")), dir.join(format!("{name}.lock")))
+    }
+
+    /// Take the channel (bind and serve) or find it taken. The lock, not the socket
+    /// file, says who serves, and it goes with the process: a socket a crash left
+    /// behind is stale and is rebound, while a copy started alongside a live one
+    /// leaves that one's socket alone.
     pub fn bind_and_serve() -> bool {
-        let path = socket_path();
-        let Ok(listener) = UnixListener::bind(&path) else { return false };
+        dir().is_some_and(|dir| listen_at(&dir))
+    }
+
+    /// True if this instance now serves the socket in `dir`.
+    pub(super) fn listen_at(dir: &Path) -> bool {
+        let (sock, lock) = paths(dir);
+        let lock = match std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(&lock) {
+            Ok(lock) => lock,
+            Err(e) => {
+                log::warn!("single-instance lock: {e}");
+                return false;
+            }
+        };
+        if let Err(e) = lock.try_lock() {
+            log::info!("single-instance socket not served by this instance: {e}");
+            return false;
+        }
+        let _ = std::fs::remove_file(&sock);
+        let listener = match UnixListener::bind(&sock) {
+            Ok(listener) => listener,
+            Err(e) => {
+                log::warn!("single-instance socket: {e}");
+                return false;
+            }
+        };
         // A socket in a shared dir is only for its own user to write to.
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        let spawned = std::thread::Builder::new().name("deeplink".into()).spawn(move || serve(listener));
+        let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+        let spawned = std::thread::Builder::new().name("deeplink".into()).spawn(move || {
+            let _lock = lock;
+            serve(listener)
+        });
         if let Err(e) = spawned {
-            log::warn!("jam link listener: {e}");
+            log::warn!("single-instance listener: {e}");
+            return false;
         }
         true
+    }
+
+    /// Hand `msg` to whoever serves the socket in `dir`. True if one took it.
+    pub(super) fn forward_at(dir: &Path, msg: &str) -> bool {
+        match UnixStream::connect(paths(dir).0) {
+            Ok(mut stream) => stream.write_all(format!("{msg}\n").as_bytes()).and_then(|()| stream.flush()).is_ok(),
+            // Nobody is listening: no running copy, or a socket a crash left behind.
+            Err(_) => false,
+        }
     }
 
     /// Hand `msg` to whoever serves the socket. `tries`: short, for a holder that's
     /// mid-exit; the channel exists as soon as the holder's process does.
     pub fn try_forward(msg: &str, tries: usize) -> bool {
-        use std::io::Write;
-        use std::os::unix::net::UnixStream;
+        let Some(dir) = dir() else { return false };
         for i in 0..tries {
-            match UnixStream::connect(socket_path()) {
-                Ok(mut stream) => {
-                    return stream.write_all(format!("{msg}\n").as_bytes()).and_then(|_| stream.flush()).is_ok();
-                }
-                // The holder is up but its socket isn't accepting quite yet, or it just
-                // died: brief retries tell those apart from "nobody's there" poorly, so
-                // only a couple, and only past the first attempt.
-                Err(e) if (e.kind() == ErrorKind::ConnectionRefused || e.kind() == ErrorKind::NotFound) && i + 1 < tries => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(_) => return false,
+            if forward_at(&dir, msg) {
+                return true;
+            }
+            // The holder is up but its socket isn't accepting quite yet, or it just
+            // died: brief retries tell those apart from "nobody's there" poorly, so
+            // only a couple, and only past the first attempt.
+            if i + 1 < tries {
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
         false
     }
 
-    /// A copy that died left its socket file behind: take the name over, if nothing
-    /// answers on it any more.
+    /// A copy that died left its socket behind: take the channel over, if the holder
+    /// is really gone (its lock went with it). False when someone is serving after all.
     pub fn take_over() -> bool {
-        if super::forward("show") {
-            return false; // Someone is there after all; leave them to it.
-        }
-        let path = socket_path();
-        let _ = std::fs::remove_file(&path);
-        bind_and_serve()
+        dir().is_some_and(|dir| listen_at(&dir))
     }
 
     fn serve(listener: UnixListener) {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut msg = Vec::new();
-            let mut buf = [0u8; 64];
-            loop {
-                match stream.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        msg.extend_from_slice(&buf[..n]);
-                        if msg.len() > 512 {
-                            break;
-                        }
-                    }
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(e) => {
+                    log::warn!("single-instance socket: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    continue;
                 }
+            };
+            // A client that connects and sends nothing mustn't hold up the next launch.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            // One line per launch, capped like the Windows pipe.
+            let mut msg = String::new();
+            if let Err(e) = BufReader::new(stream.take(257)).read_line(&mut msg) {
+                log::warn!("single-instance socket: {e}");
+                continue;
             }
-            super::received(String::from_utf8_lossy(&msg).trim().to_owned());
+            super::received(msg.trim().to_owned());
         }
     }
 }
@@ -479,7 +541,7 @@ mod win {
         }
     }
 
-    /// The registry writer for `ytm-rs:` links (see `register_protocol`).
+    /// The registry writer for `ytm-rs:` and `bitchord:` links (see `register_protocol`).
     pub(super) fn register_at(root: HKEY, key: &str, exe: &str) -> windows::core::Result<()> {
         let set = |sub: &str, name: &str, value: &str| -> windows::core::Result<()> {
             let path = if sub.is_empty() { key.to_string() } else { format!(r"{key}\{sub}") };
@@ -504,17 +566,22 @@ mod win {
     }
 }
 
-/// Register the `ytm-rs:` URL protocol for this user, pointing at this exe.
+/// Register the `ytm-rs:` and `bitchord:` URL protocols for this user, pointing at
+/// this exe. The party's invite links (`bitchord://party/CODE`) need the second.
 /// Call only from an installed copy, so dev builds don't take the protocol over.
 #[cfg(windows)]
 pub fn register_protocol() {
     match std::env::current_exe() {
         Ok(exe) => {
-            if let Err(e) = win::register_at(HKEY_CURRENT_USER, r"Software\Classes\ytm-rs", &exe.to_string_lossy()) {
+            let exe = exe.to_string_lossy();
+            if let Err(e) = win::register_at(HKEY_CURRENT_USER, r"Software\Classes\ytm-rs", &exe) {
                 log::warn!("registering the ytm-rs: protocol: {e}");
             }
+            if let Err(e) = win::register_at(HKEY_CURRENT_USER, r"Software\Classes\bitchord", &exe) {
+                log::warn!("registering the bitchord: protocol: {e}");
+            }
         }
-        Err(e) => log::warn!("registering the ytm-rs: protocol: {e}"),
+        Err(e) => log::warn!("registering the link protocols: {e}"),
     }
 }
 
@@ -535,6 +602,9 @@ mod tests {
         assert_eq!(parse("YTM-RS://JAM/aBc234"), Some(Invite::Jam("ABC234".into())));
         assert_eq!(parse("\"ytm-rs://jam/ABC234\""), Some(Invite::Jam("ABC234".into())));
         assert_eq!(parse("ytm-rs://jam/?c=xyz789"), Some(Invite::Jam("XYZ789".into())));
+        // The relay's alphabet has 0 and 1; I, L and O are read as the digits they shadow.
+        assert_eq!(parse("ytm-rs://jam/ABC0I1"), Some(Invite::Jam("ABC011".into())));
+        assert_eq!(parse("ytm-rs://jam/ABCOIL"), Some(Invite::Jam("ABC011".into())));
         assert_eq!(parse("bitchord://party/XYZ789"), Some(Invite::Party("XYZ789".into(), None)));
         assert_eq!(
             parse("https://bitchord.kushagrasingh.in/invite/xyz789?server=party.example.com"),
@@ -568,7 +638,7 @@ mod tests {
             "ytm-rs://jam/",
             "ytm-rs://jam/ABC23",      // too short
             "ytm-rs://jam/ABC2345",    // too long
-            "ytm-rs://jam/ABC0I1",     // 0, I, 1 are not in the alphabet
+            "ytm-rs://jam/ÄBC234",     // non-ASCII falls away, and what's left is too short
             "ytm-rs://jam/ABC234/xyz", // extra path
             "ytm-rs://room/ABC234",
             "https://example.com/ytm-rs/jam/?c=ABC234",
@@ -594,6 +664,61 @@ mod tests {
         assert!(name.starts_with("ytm-rs-jam-"), "{name}");
         // The Windows pipe form keeps its prefix; the Unix socket form is a plain name.
         assert!(!name.contains('\\'));
+    }
+
+    #[test]
+    fn socket_dir() {
+        let tmp = std::path::Path::new("/tmp");
+        assert_eq!(runtime_dir(Some("/run/user/1000".into()), tmp, 1000), std::path::Path::new("/run/user/1000"));
+        // Unset, empty or relative: our own directory in the temp dir, never the working one.
+        for xdg in [None, Some("".into()), Some("run".into())] {
+            assert_eq!(runtime_dir(xdg, tmp, 1000), std::path::Path::new("/tmp/bitchord-1000"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_instance_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let dir = std::env::temp_dir().join(format!("bitchord-deeplink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+
+        // Only a directory of ours alone is trusted.
+        mode(0o755);
+        assert!(unix::private_dir(&dir, uid).is_err());
+        mode(0o700);
+        assert!(unix::private_dir(&dir, uid).is_ok());
+        assert!(unix::private_dir(&dir, uid.wrapping_add(1)).is_err());
+        let link = dir.with_extension("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(unix::private_dir(&link, uid).is_err());
+        std::fs::remove_file(&link).unwrap();
+
+        // A socket a crash left behind: nobody takes the launch, and the next copy serves.
+        let (sock, _) = unix::paths(&dir);
+        drop(UnixListener::bind(&sock).unwrap());
+        assert!(!unix::forward_at(&dir, SHOW_MSG));
+        assert!(unix::listen_at(&dir));
+        // A copy started alongside leaves the live socket alone.
+        assert!(!unix::listen_at(&dir));
+
+        // A client that connects and says nothing doesn't hold up the next launch.
+        let _silent = UnixStream::connect(&sock).unwrap();
+        assert!(unix::forward_at(&dir, SHOW_MSG));
+        let mut shown = false;
+        for _ in 0..100 {
+            if take_show() {
+                shown = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(shown, "the launch got through");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

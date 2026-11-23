@@ -10,12 +10,43 @@ use super::{Action, App, Dialog, notes, pages, widgets};
 
 impl App {
     pub(super) fn draw_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(Dialog::ConfirmClearCache) = &self.dialog {
+            let mut body = "Saved covers, translated lyrics and the lyrics check's browser data are deleted. They come back as you play and browse. Your library and your downloads stay as they are.".to_owned();
+            if let Some(n) = self.storage.known().map(|u| u.cache).filter(|n| *n > 0) {
+                body.push_str(&format!(" This frees up {}.", crate::cache::format_size(n)));
+            }
+            match confirm(ctx, "Clear the cache?", &body, "Clear cache", "Clear cache") {
+                Some(true) => {
+                    self.clear_cache(ctx);
+                    self.dialog = None;
+                }
+                Some(false) => self.dialog = None,
+                None => {}
+            }
+            return;
+        }
+        if let Some(Dialog::ConfirmRemoveDownloads) = &self.dialog {
+            let mut body = "Every downloaded song is deleted. They stay in your library and stream again when you play them, so they'll need a connection.".to_owned();
+            if let Some(n) = self.storage.known().map(|u| u.downloads).filter(|n| *n > 0) {
+                body.push_str(&format!(" This frees up {}.", crate::cache::format_size(n)));
+            }
+            match confirm(ctx, "Remove all downloads?", &body, "Remove all", "Remove all downloads") {
+                Some(true) => {
+                    self.remove_downloads(ctx);
+                    self.dialog = None;
+                }
+                Some(false) => self.dialog = None,
+                None => {}
+            }
+            return;
+        }
         if let Some(Dialog::ConfirmDelete { id, title }) = &self.dialog {
             let (id, title) = (id.clone(), title.clone());
-            match confirm_delete(ctx, &title, self.accent_color()) {
+            let body = format!("\u{201c}{title}\u{201d} will be removed from your YouTube Music library. This can't be undone.");
+            match confirm(ctx, "Delete playlist?", &body, "Delete", "Delete playlist") {
                 Some(true) => {
-                    self.backend.request(Req::DeletePlaylist(id));
                     self.dialog = None;
+                    self.delete_soon(id);
                 }
                 Some(false) => self.dialog = None,
                 None => {}
@@ -30,6 +61,9 @@ impl App {
             Dialog::NewPlaylist { .. } => "New playlist",
             Dialog::EditPlaylist { .. } => "Edit playlist",
             Dialog::ConfirmDelete { .. } => "Delete playlist",
+            Dialog::ConfirmClearCache => "Clear cache",
+            Dialog::ConfirmRemoveDownloads => "Remove all downloads",
+            Dialog::ConfirmDownload { .. } => "Download",
             Dialog::Collaborate { .. } => "Collaborate",
         };
         // The same modal card as "Delete playlist?" and the update dialog.
@@ -49,13 +83,14 @@ impl App {
                         pages::divider(ui);
                         ui.add_space(6.0);
                         let cards = self.library.as_ref().map(|l| l.playlists.clone()).unwrap_or_default();
+                        let order = super::collections::pinned_first(&self.pinned, &cards, 0..cards.len());
                         egui::ScrollArea::vertical().max_height(340.0).auto_shrink([false, true]).show(ui, |ui| {
-                            for card in cards {
-                                if let Target::Playlist(id) = card.target {
+                            for card in order.into_iter().map(|i| &cards[i]) {
+                                if let Target::Playlist(id) = &card.target {
                                     if !id.starts_with("PL") { continue; }
                                     if dialog_row(ui, Some(&card.thumbs), None, &card.title) {
                                         let video_ids = tracks.iter().map(|t| t.id.clone()).collect();
-                                        self.backend.request(Req::AddToPlaylist { playlist_id: id, video_ids });
+                                        self.backend.request(Req::AddToPlaylist { playlist_id: id.clone(), video_ids });
                                         done = true;
                                     }
                                 }
@@ -91,8 +126,20 @@ impl App {
                         }
                         done |= cancel;
                     }
+                    Dialog::ConfirmDownload { target, title, tracks, count } => {
+                        let what = if target.is_some() { format!("\u{201c}{title}\u{201d} has {count} songs") } else { format!("{count} songs are") };
+                        let body = format!("{what} not downloaded yet. They download in the background, and the song that's playing goes first.");
+                        ui.add(egui::Label::new(egui::RichText::new(body).font(theme::regular(14.0)).color(theme::text_dim())).wrap());
+                        ui.add_space(22.0);
+                        let (ok, cancel) = dialog_buttons(ui, &format!("Download {count} songs"), true, accent);
+                        if ok {
+                            let (target, title, tracks) = (target.clone(), title.clone(), Some(std::mem::take(tracks)));
+                            self.backend.request(Req::DownloadMany { target, title, tracks, confirmed: true });
+                        }
+                        done = ok || cancel;
+                    }
                     Dialog::Collaborate { info, busy, confirm_off, .. } => done = self.collaborate_dialog(ui, info, busy, confirm_off, accent),
-                    Dialog::ConfirmDelete { .. } => unreachable!("drawn by confirm_delete"),
+                    Dialog::ConfirmDelete { .. } | Dialog::ConfirmClearCache | Dialog::ConfirmRemoveDownloads => unreachable!("drawn by confirm"),
                 }
             });
         });
@@ -278,25 +325,24 @@ fn dialog_row(ui: &mut Ui, thumbs: Option<&[crate::model::Thumb]>, glyph: Option
     resp.clicked()
 }
 
-/// "Delete playlist?" as a modal card: Some(true) delete, Some(false) cancel, None still open.
-fn confirm_delete(ctx: &egui::Context, title: &str, _accent: Color32) -> Option<bool> {
+/// A question like "Delete playlist?" as a modal card, its answer in red: Some(true)
+/// yes, Some(false) cancel, None still open. `name` is the button's, for screen readers.
+fn confirm(ctx: &egui::Context, heading: &str, body: &str, label: &str, name: &str) -> Option<bool> {
     let mut answer = None;
     let modal = egui::Modal::new(egui::Id::unique("confirm-delete")).frame(notes::surface()).backdrop_color(theme::shade(0.55)).show(ctx, |ui| {
         ui.set_width(400.0_f32.min(ctx.content_rect().width() - 48.0));
         egui::Frame::new().inner_margin(egui::Margin { left: 26, right: 26, top: 24, bottom: 22 }).show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            ui.label(egui::RichText::new("Delete playlist?").font(theme::bold(22.0)).color(theme::text()));
+            ui.label(egui::RichText::new(heading).font(theme::bold(22.0)).color(theme::text()));
             ui.add_space(10.0);
-            let body = format!("\u{201c}{title}\u{201d} will be removed from your YouTube Music library. This can't be undone.");
             ui.add(egui::Label::new(egui::RichText::new(body).font(theme::regular(14.0)).color(theme::text_dim())).wrap());
             ui.add_space(22.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 // Destructive action in red, white text.
-                let label = "Delete";
                 let g = ui.painter().layout_no_wrap(label.to_owned(), theme::semibold(14.0), Color32::WHITE);
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(g.size().x + 40.0, 38.0), egui::Sense::click());
-                let resp = widgets::named(resp, "Delete playlist").on_hover_cursor(egui::CursorIcon::PointingHand);
+                let resp = widgets::named(resp, name).on_hover_cursor(egui::CursorIcon::PointingHand);
                 let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.15);
                 ui.painter().rect_filled(rect, 19.0, theme::lerp_color(Color32::from_rgb(214, 40, 57), Color32::from_rgb(236, 56, 72), h));
                 ui.painter().galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);

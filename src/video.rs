@@ -19,6 +19,9 @@ use crate::innertube::VideoStream;
 
 /// Frames kept ready: under half a second, about 30 MB at 720p.
 const READY: usize = 12;
+/// …and never more than this much decoded picture waiting: 12 frames at 1080p is a
+/// hundred megabytes, so bigger streams keep fewer.
+const READY_BYTES: usize = 48 * 1024 * 1024;
 /// Decoded this far behind the clock, a frame isn't worth converting: it would never show.
 const LATE: f64 = 0.05;
 /// The clock this far before what's waiting to show is a seek back.
@@ -440,6 +443,39 @@ pub fn glow_colors(frame: &egui::ColorImage) -> Vec<[f32; 3]> {
     out
 }
 
+/// The part of a frame inside black bars that came with the video (a 4:3 video sent as 16:9,
+/// a film letterboxed in it), as a fraction of the frame. `None` when the frame is too dark
+/// at its edges to tell. Bars count only as wide on both sides, so a dark scene at one edge
+/// doesn't crop the picture.
+pub fn content_uv(frame: &egui::ColorImage) -> Option<egui::Rect> {
+    let [w, h] = frame.size;
+    if w < 32 || h < 32 || frame.pixels.len() < w * h {
+        return None;
+    }
+    let dark = |c: egui::Color32| c.r().max(c.g()).max(c.b()) < 28;
+    let col = |x: usize| (0..h).step_by((h / 48).max(1)).all(|y| dark(frame.pixels[y * w + x]));
+    let row = |y: usize| (0..w).step_by((w / 64).max(1)).all(|x| dark(frame.pixels[y * w + x]));
+    let (cap_x, cap_y) = (w / 4, h / 4);
+    let left = (0..cap_x).take_while(|&x| col(x)).count();
+    let right = (0..cap_x).take_while(|&x| col(w - 1 - x)).count();
+    let top = (0..cap_y).take_while(|&y| row(y)).count();
+    let bottom = (0..cap_y).take_while(|&y| row(h - 1 - y)).count();
+    // Dark right across: a dark scene, not bars.
+    if (left == cap_x && right == cap_x) || (top == cap_y && bottom == cap_y) {
+        return None;
+    }
+    // A bar under 1% is the encoder's edge, not a bar. Past one, 2 px more for its soft edge.
+    let bar = |a: usize, b: usize, size: usize| match a.min(b) {
+        n if n * 100 < size => 0,
+        n => (n + 2).min(size / 4),
+    };
+    let (x, y) = (bar(left, right, w), bar(top, bottom, h));
+    Some(egui::Rect::from_min_max(
+        egui::pos2(x as f32 / w as f32, y as f32 / h as f32),
+        egui::pos2(1.0 - x as f32 / w as f32, 1.0 - y as f32 / h as f32),
+    ))
+}
+
 #[derive(Default)]
 struct Shared {
     frames: Mutex<VecDeque<Frame>>,
@@ -451,10 +487,12 @@ struct Shared {
 pub struct Player {
     shared: Arc<Shared>,
     status: Arc<AudioStatus>,
+    height: u32,
 }
 
 impl Player {
     pub fn start(stream: VideoStream, http: reqwest::Client, status: Arc<AudioStatus>) -> Self {
+        let height = stream.height;
         let shared = Arc::new(Shared::default());
         let (s, clock) = (shared.clone(), status.clone());
         std::thread::Builder::new()
@@ -466,7 +504,12 @@ impl Player {
                 }
             })
             .expect("a thread for the video");
-        Self { shared, status }
+        Self { shared, status, height }
+    }
+
+    /// How tall the stream it plays is: the quality it plays at.
+    pub fn height(&self) -> u32 {
+        self.height
     }
 
     /// The frame to show now, if a newer one than the last is due.
@@ -546,6 +589,8 @@ fn run(stream: &VideoStream, http: &reqwest::Client, status: &AudioStatus, share
     log::info!("video: {}x{}, {} fragments", stream.width, stream.height, fragments.len());
 
     let mut decoder = new_decoder(&track)?;
+    let frame_bytes = stream.width as usize * stream.height as usize * 4;
+    let ready = (READY_BYTES / frame_bytes.max(1)).clamp(4, READY);
     let mut next = fragment_at(&fragments, status.position_smooth().as_secs_f64());
     let mut pending: BinaryHeap<Pts> = BinaryHeap::new();
     // The last frame out of the decoder: with none waiting to show, where the picture is.
@@ -607,7 +652,7 @@ fn run(stream: &VideoStream, http: &reqwest::Client, status: &AudioStatus, share
                         restart = Some(at);
                         continue 'play;
                     }
-                    if shared.frames.lock().unwrap().len() < READY {
+                    if shared.frames.lock().unwrap().len() < ready {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -845,5 +890,29 @@ mod tests {
             heap.push(Pts(p));
         }
         assert_eq!([heap.pop().unwrap().0, heap.pop().unwrap().0, heap.pop().unwrap().0], [0.0, 0.1, 0.2]);
+    }
+
+    /// A 160×90 frame, grey inside `inner` (in pixels) and black around it.
+    fn framed(inner: egui::Rect) -> egui::ColorImage {
+        let (w, h) = (160, 90);
+        let pixels = (0..w * h).map(|i| if inner.contains(egui::pos2((i % w) as f32 + 0.5, (i / w) as f32 + 0.5)) { egui::Color32::from_gray(120) } else { egui::Color32::BLACK }).collect();
+        egui::ColorImage { size: [w, h], source_size: egui::vec2(w as f32, h as f32), pixels }
+    }
+
+    #[test]
+    fn a_4_3_video_sent_as_16_9_has_its_side_bars_found() {
+        // 120 of 160 wide: 20 px bars each side, plus 2 for their edge.
+        let uv = content_uv(&framed(egui::Rect::from_min_max(egui::pos2(20.0, 0.0), egui::pos2(140.0, 90.0)))).unwrap();
+        assert!((uv.left() - 22.0 / 160.0).abs() < 1e-4 && (uv.right() - 138.0 / 160.0).abs() < 1e-4, "{uv:?}");
+        assert_eq!((uv.top(), uv.bottom()), (0.0, 1.0));
+    }
+
+    #[test]
+    fn darkness_at_one_edge_or_all_over_isnt_bars() {
+        // Dark down the left only: a dark scene, so nothing is cut.
+        let uv = content_uv(&framed(egui::Rect::from_min_max(egui::pos2(30.0, 0.0), egui::pos2(160.0, 90.0)))).unwrap();
+        assert_eq!(uv, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)));
+        // All black: can't tell.
+        assert_eq!(content_uv(&framed(egui::Rect::NOTHING)), None);
     }
 }

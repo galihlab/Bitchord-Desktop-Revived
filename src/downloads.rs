@@ -5,7 +5,7 @@
 //! `downloads.json` in the data dir maps video ids to their files; a file that was
 //! moved or deleted just stops counting as downloaded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -23,6 +23,9 @@ struct Entry {
     /// video plays it from this file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stands_for: Option<String>,
+    /// More music videos this file is the song version of.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    videos: Vec<String>,
     /// The song as it was downloaded, for the Downloads page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     song: Option<Track>,
@@ -33,10 +36,16 @@ struct State {
     /// Where the index is saved (the data dir's downloads.json).
     file: PathBuf,
     folder: PathBuf,
+    /// Songs whose file wasn't there when last looked for. They stay in the index: a
+    /// folder on a drive that's away has them back when it's back.
+    gone: HashSet<String>,
+    /// The songs saved this session, in the order they were: the Downloads page takes
+    /// on the new ones (`saved_since`) without looking at every file again.
+    saved: Vec<String>,
 }
 
 static STATE: LazyLock<RwLock<State>> =
-    LazyLock::new(|| RwLock::new(State { index: HashMap::new(), file: PathBuf::new(), folder: default_folder() }));
+    LazyLock::new(|| RwLock::new(State { index: HashMap::new(), file: PathBuf::new(), folder: default_folder(), gone: HashSet::new(), saved: Vec::new() }));
 
 /// Music\BitChord.
 pub fn default_folder() -> PathBuf {
@@ -54,6 +63,45 @@ pub fn init(data_dir: &Path, folder: &str) {
     st.index = index;
     st.file = file;
     st.folder = if folder.is_empty() { default_folder() } else { PathBuf::from(folder) };
+    drop(st);
+    // Which files are gone: disk work, off the UI thread.
+    std::thread::spawn(|| {
+        let entries: Vec<(String, PathBuf)> = STATE.read().unwrap().index.iter().map(|(id, e)| (id.clone(), e.path.clone())).collect();
+        set_gone(entries.into_iter().filter(|(_, p)| !p.is_file()).collect());
+    });
+}
+
+/// Remember these songs' files as gone (unless one's been saved again meanwhile).
+fn set_gone(missing: Vec<(String, PathBuf)>) {
+    let mut st = STATE.write().unwrap();
+    let gone = missing.into_iter().filter(|(id, p)| st.index.get(id).is_some_and(|e| &e.path == p && !p.is_file())).map(|(id, _)| id).collect();
+    st.gone = gone;
+    LOOKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+static LOOKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the files have been looked for: what was worked out from an earlier look
+/// is worked out again.
+pub fn looks() -> u64 {
+    LOOKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Save the index whole or not at all: a crash mid-write doesn't lose it. Called after
+/// a change, with `STATE` let go, so the file is written without holding anyone up. One
+/// write at a time, each of the index as it is then: the last write has the last change.
+fn write_index() {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let (json, file) = {
+        let st = STATE.read().unwrap();
+        (serde_json::to_vec(&st.index), st.file.clone())
+    };
+    let Ok(json) = json else { return };
+    let tmp = file.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &file)) {
+        log::warn!("couldn't save the downloads index: {e}");
+    }
 }
 
 pub fn folder() -> PathBuf {
@@ -118,26 +166,159 @@ pub fn path(video_id: &str) -> Option<PathBuf> {
     STATE.read().unwrap().index.get(video_id).map(|e| e.path.clone()).filter(|p| p.is_file())
 }
 
-/// The downloaded songs still on disk, newest first.
-pub fn list() -> Vec<Track> {
+/// Whether all these songs are downloaded, as last looked (no look at the files now, so
+/// it's quick enough for the UI thread; startup and the Downloads page look).
+/// A music video counts when its song version is.
+pub fn all_listed(tracks: &[Track]) -> bool {
     let st = STATE.read().unwrap();
-    let mut out: Vec<(std::time::SystemTime, Track)> = st
-        .index
-        .values()
-        .filter(|e| e.path.is_file())
-        .filter_map(|e| {
-            let modified = std::fs::metadata(&e.path).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
-            e.song.clone().map(|t| (modified, t))
+    let videos: HashSet<&str> = match tracks.iter().any(|t| t.music_video) {
+        true => st.index.iter().filter(|(id, _)| !st.gone.contains(*id)).flat_map(|(_, e)| e.stands_for.iter().chain(&e.videos)).map(String::as_str).collect(),
+        false => Default::default(),
+    };
+    tracks.iter().all(|t| (st.index.contains_key(&t.id) && !st.gone.contains(&t.id)) || (t.music_video && videos.contains(t.id.as_str())))
+}
+
+/// The downloaded songs still on disk, newest first: the Downloads page. A song
+/// version is listed as the song (its file plays for the music video too).
+pub fn list() -> Vec<Track> {
+    let entries: Vec<(String, Entry)> = STATE.read().unwrap().index.iter().map(|(id, e)| (id.clone(), e.clone())).collect();
+    let mut missing = Vec::new();
+    let mut found: Vec<(std::time::SystemTime, Track)> = entries
+        .into_iter()
+        .filter_map(|(id, e)| {
+            let Some(meta) = std::fs::metadata(&e.path).ok().filter(|m| m.is_file()) else {
+                missing.push((id, e.path));
+                return None;
+            };
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            Some((modified, listed(id, e)))
         })
         .collect();
-    out.sort_by(|a, b| b.0.cmp(&a.0));
-    out.into_iter().map(|(_, t)| t).collect()
+    set_gone(missing);
+    found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    found.into_iter().map(|(_, t)| t).collect()
+}
+
+/// How many songs are downloaded, as last looked: no look at the files now, so it's
+/// quick enough for Settings › Storage. `list` looks, and corrects this.
+pub fn count() -> usize {
+    let st = STATE.read().unwrap();
+    st.index.len() - st.gone.len()
+}
+
+/// Delete every downloaded song's file and empty the index (Settings › Storage). The
+/// songs stay in the library and stream again when played. A file that can't be
+/// deleted — the song playing, on Windows — keeps its place until it can. Returns how
+/// many went and the bytes they took.
+pub fn remove_all_files() -> (usize, u64) {
+    let mut st = STATE.write().unwrap();
+    let mut keep = HashMap::new();
+    let (mut songs, mut bytes) = (0, 0);
+    for (id, e) in st.index.drain() {
+        let len = std::fs::metadata(&e.path).map_or(0, |m| m.len());
+        let gone = match std::fs::remove_file(&e.path) {
+            Ok(()) => true,
+            // Already deleted by hand: nothing to keep.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => {
+                log::warn!("couldn't remove {}: {err}", e.path.display());
+                false
+            }
+        };
+        if gone {
+            songs += 1;
+            bytes += len;
+        } else {
+            keep.insert(id, e);
+        }
+    }
+    st.index = keep;
+    st.gone.clear();
+    st.saved.clear();
+    drop(st);
+    write_index();
+    (songs, bytes)
+}
+
+/// How many songs have been saved this session. Read before `list`: `saved_since` from
+/// it gives the ones saved after.
+pub fn saves() -> usize {
+    STATE.read().unwrap().saved.len()
+}
+
+/// The songs saved this session after the first `from`, newest first (each once), and
+/// where to ask from next time. From the index alone, no look at the disk: quick enough
+/// for the UI thread as each song of a run lands.
+pub fn saved_since(from: usize) -> (usize, Vec<Track>) {
+    let st = STATE.read().unwrap();
+    let mut seen = HashSet::new();
+    let tracks = st
+        .saved
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .filter(|id| seen.insert(id.as_str()))
+        .filter_map(|id| Some(listed(id.clone(), st.index.get(id)?.clone())))
+        .collect();
+    (st.saved.len(), tracks)
+}
+
+/// A downloaded song as the Downloads page lists it: as the song (its file plays for the
+/// music video too).
+fn listed(id: String, e: Entry) -> Track {
+    let mut t = e.song.unwrap_or_else(|| Track { id: id.clone(), ..Default::default() });
+    t.id = id;
+    (t.music_video, t.video) = (false, false);
+    if e.duration_ms > 0 {
+        t.duration = Some((e.duration_ms / 1000) as u32);
+    }
+    t
 }
 
 /// The downloaded song version of the music video `video_id`, if its file is still there.
 pub fn song_for(video_id: &str) -> Option<Track> {
     let st = STATE.read().unwrap();
-    st.index.values().find(|e| e.stands_for.as_deref() == Some(video_id) && e.path.is_file()).and_then(|e| e.song.clone())
+    st.index
+        .values()
+        .find(|e| (e.stands_for.as_deref() == Some(video_id) || e.videos.iter().any(|v| v == video_id)) && e.path.is_file())
+        .and_then(|e| e.song.clone())
+}
+
+/// The downloaded song `song_id` is the song version of the music video `video_id` too.
+/// Writes the index: disk work.
+pub fn link_video(song_id: &str, video_id: &str) {
+    {
+        let mut st = STATE.write().unwrap();
+        let Some(e) = st.index.get_mut(song_id) else { return };
+        if !add_video(&mut e.stands_for, &mut e.videos, video_id) {
+            return;
+        }
+    }
+    write_index();
+}
+
+/// The song's file if it's downloaded and still there; then, given `for_video`, it's
+/// that music video's song version too. Disk work.
+pub fn reuse(song_id: &str, for_video: Option<&str>) -> Option<PathBuf> {
+    let path = path(song_id)?;
+    if let Some(v) = for_video {
+        link_video(song_id, v);
+    }
+    Some(path)
+}
+
+/// Make a song version stand for the music video `video_id` too: the first one it's
+/// for, else one more. False when it did already.
+fn add_video(first: &mut Option<String>, videos: &mut Vec<String>, video_id: &str) -> bool {
+    if first.as_deref() == Some(video_id) || videos.iter().any(|v| v == video_id) {
+        return false;
+    }
+    match first {
+        None => *first = Some(video_id.to_owned()),
+        Some(_) => videos.push(video_id.to_owned()),
+    }
+    true
 }
 
 /// A downloaded song's audio, as a complete stream buffer for playback.
@@ -178,13 +359,20 @@ pub fn save(t: &Track, audio: &[u8], duration_ms: u64, loudness_db: Option<f32>,
         log::warn!("couldn't tag {}: {e:#}", path.display());
     }
     std::fs::rename(&part, &path)?;
-    let mut st = STATE.write().unwrap();
-    // Every entry keeps its song, so the Downloads page can list it later.
-    let song = Some(t.clone());
-    st.index.insert(t.id.clone(), Entry { path: path.clone(), duration_ms, loudness_db, stands_for, song });
-    if let Ok(json) = serde_json::to_vec(&st.index) {
-        let _ = std::fs::write(&st.file, json);
+    {
+        let mut st = STATE.write().unwrap();
+        // Saved again, it stays the song version of the videos it was already.
+        let (mut first, mut videos) = st.index.get(&t.id).map(|e| (e.stands_for.clone(), e.videos.clone())).unwrap_or_default();
+        if let Some(v) = &stands_for {
+            add_video(&mut first, &mut videos, v);
+        }
+        // Every entry keeps its song, so the Downloads page can list it later.
+        let song = Some(t.clone());
+        st.gone.remove(&t.id);
+        st.index.insert(t.id.clone(), Entry { path: path.clone(), duration_ms, loudness_db, stands_for: first, videos, song });
+        st.saved.push(t.id.clone());
     }
+    write_index();
     Ok(path)
 }
 
@@ -249,5 +437,67 @@ mod tests {
         let t = track("What? / Why: \"Now\"...", vec![Link { name: "AC/DC".into(), id: None }]);
         assert_eq!(file_stem(&t), "AC_DC - What_ _ Why_ _Now_");
         assert_eq!(file_stem(&track("...", Vec::new())), "abc");
+    }
+
+    #[test]
+    fn a_song_version_stands_for_each_video_once() {
+        let (mut first, mut videos) = (None, Vec::new());
+        assert!(add_video(&mut first, &mut videos, "v1"));
+        assert!(add_video(&mut first, &mut videos, "v2"));
+        assert!(!add_video(&mut first, &mut videos, "v1"));
+        assert!(!add_video(&mut first, &mut videos, "v2"));
+        assert_eq!((first.as_deref(), videos), (Some("v1"), vec!["v2".to_owned()]));
+    }
+
+    /// The only test that sets up `STATE`: saving, linking videos and what the Downloads
+    /// page takes on, in a folder of its own.
+    #[test]
+    fn saves_link_videos_and_are_taken_on() {
+        let dir = std::env::temp_dir().join(format!("bitchord-downloads-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir, &dir.join("music").display().to_string());
+        let song = |id: &str, title: &str| Track { id: id.into(), title: title.into(), ..Default::default() };
+        let from = saves();
+
+        let a = save(&song("a", "Same"), b"not mp4", 61_000, None, None, Some("va".into())).unwrap();
+        let b = save(&song("b", "Same"), b"not mp4", 0, None, None, None).unwrap();
+        assert_ne!(a, b, "two songs of one name get a file each");
+        assert!(a.is_file() && b.is_file());
+
+        // Saved again, a song keeps its file and the videos it stood for.
+        assert_eq!(save(&song("a", "Same"), b"not mp4", 61_000, None, None, Some("vb".into())).unwrap(), a);
+        link_video("a", "vc");
+        link_video("a", "va");
+        assert_eq!(reuse("a", Some("vd")), Some(a.clone()));
+        assert_eq!(reuse("missing", Some("ve")), None);
+        {
+            let st = STATE.read().unwrap();
+            let e = &st.index["a"];
+            assert_eq!(e.stands_for.as_deref(), Some("va"));
+            assert_eq!(e.videos, ["vb", "vc", "vd"]);
+            assert!(e.song.is_some());
+        }
+        assert_eq!(song_for("vc").map(|t| t.id), Some("a".to_owned()));
+
+        // Written to disk with every change, read back whole.
+        let written: HashMap<String, Entry> = serde_json::from_slice(&std::fs::read(dir.join("downloads.json")).unwrap()).unwrap();
+        assert_eq!(written["a"].videos, ["vb", "vc", "vd"]);
+        assert!(written.contains_key("b"));
+
+        // Newest first, each once, without the music video flags; then nothing new.
+        let (seen, new) = saved_since(from);
+        assert_eq!(new.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(new[0].duration, Some(61));
+        assert_eq!(saved_since(seen), (seen, Vec::new()));
+
+        // Removal takes the files and the index with it, and says what went.
+        let were = (a.metadata().unwrap().len(), b.metadata().unwrap().len());
+        let (songs, bytes) = remove_all_files();
+        assert_eq!((songs, bytes), (2, were.0 + were.1));
+        assert!(list().is_empty() && count() == 0);
+        assert!(!a.is_file() && !b.is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

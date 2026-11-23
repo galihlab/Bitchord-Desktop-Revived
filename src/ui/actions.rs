@@ -1,25 +1,24 @@
 //! What clicks and keys ask for: the actions pages queue up, and keyboard shortcuts.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::backend::Req;
 use crate::model::{Target, Track};
 
-use super::lists::LIKED_MUSIC;
+use super::lists::{self, LIKED_MUSIC};
 use super::queue::QueueFill;
-use super::{Action, App, Dialog, LibTab, NpTab, Page, jam, keybinds, transfer};
+use super::undo::Undo;
+use super::{Action, App, Dialog, LibTab, NpTab, Page, jam, keybinds, palette, transfer};
 
 impl App {
     pub(super) fn apply(&mut self, a: Action) {
-        // In someone else's jam, playback changes become requests to the host.
-        let a = if self.jam.guest() {
-            match jam::guest_action(self, a) {
-                Some(a) => a,
-                None => return,
-            }
-        } else {
-            a
-        };
+        // In a party only the host drives, the relay turns these down for us: say so
+        // instead of clicking into nothing. Playing the current song stays ours (a pause).
+        if self.jam.locked() && jam::refused(self, &a) {
+            self.toast("Only the host can change the party");
+            return;
+        }
         // In a locked party, pause is the listener's own; a resume rejoins the party.
         let a = match super::party::locked_action(self, a) {
             Some(a) => a,
@@ -36,7 +35,10 @@ impl App {
                 | Action::Radio(_)
                 | Action::QueueJump(_)
                 | Action::QueueRemove(_)
-                | Action::QueueMove(..)
+                | Action::QueueClear
+                | Action::Undo
+                | Action::QueueMove { .. }
+                | Action::QueueInsert { .. }
                 | Action::Seek(_)
                 | Action::TogglePlay
         ) {
@@ -83,13 +85,21 @@ impl App {
                 self.play_list(vec![t.clone()], 0);
                 if !self.radio_pending {
                     self.radio_pending = true;
-                    self.backend.request(Req::Radio { song_of: self.song_of(&t), seed: t.id });
+                    // the taste travels with the ask: the song itself plays whatever it
+                    // is (the listener chose it), only what lines up around it is ruled on
+                    let taste = crate::recommend::TasteLite::of(&self.listening, self.hide_explicit);
+                    self.backend.request(Req::Radio { song_of: self.song_of(&t), seed: t.id, taste });
                 }
+            }
+            Action::NotRecommended(t) => {
+                self.listening.ban(&t.id);
+                self.listening.store(self.backend.data_dir());
+                self.toast(format!("\"{}\" won't be recommended", t.title));
             }
             Action::Open(Target::Album(id)) => self.go(Page::Album(id)),
             Action::Open(Target::Playlist(id)) => self.go(Page::Playlist(id)),
             Action::Open(Target::Artist(id)) => self.go(Page::Artist(id)),
-            Action::PlayNext(t) | Action::Enqueue(t) if self.explicit_hidden(&t) => {}
+            Action::PlayNext(t) | Action::Enqueue(t) | Action::QueueInsert { track: t, .. } if self.explicit_hidden(&t) => {}
             Action::PlayNext(t) => {
                 let start = self.queue.play_next(t);
                 self.toast("Playing next");
@@ -113,8 +123,28 @@ impl App {
                 self.queue.drop_explicit();
                 self.play_current();
             }
-            Action::QueueRemove(i) => self.queue.remove(i),
-            Action::QueueMove(from, to) => self.queue.move_track(from, to),
+            Action::QueueRemove(i) => {
+                if let Some(saved) = self.queue.remove(i) {
+                    self.toast_undo("Removed from queue", Undo::Queue(saved));
+                    self.prefetch_next();
+                }
+            }
+            Action::QueueClear => {
+                if let Some(saved) = self.queue.clear() {
+                    self.toast_undo("Queue cleared", Undo::Queue(saved));
+                }
+            }
+            Action::Undo => self.undo(),
+            Action::QueueInsert { gap, track } => {
+                self.queue.insert_at(gap, track);
+                self.toast("Added to queue");
+                self.prefetch_next();
+            }
+            Action::QueueMove { from, gap, id } => {
+                if self.queue.tracks.get(from).is_some_and(|t| t.id == id) && self.queue.move_track(from, gap) {
+                    self.prefetch_next();
+                }
+            }
             Action::ViewQueue => {
                 if self.np_open {
                     self.np_tab = NpTab::UpNext;
@@ -124,11 +154,22 @@ impl App {
             }
             Action::ToggleVideo => {
                 self.show_video = !self.show_video;
-                // Its song is playing: a video only stays in time with its own audio.
-                if self.show_video {
+                // Its song is playing: a video only stays in time with its own audio. A
+                // song's music video goes with Video off; Video on leaves a song be.
+                if self.show_video == self.current().is_some_and(|t| t.has_video()) {
                     self.play_listed_upload();
-                } else if self.current().is_some_and(|t| t.music_video) && self.play_songs && !self.jam.active() {
+                } else if !self.show_video && self.current().is_some_and(|t| t.music_video) && self.play_songs && !self.jam.active() {
                     self.play_song_version();
+                }
+            }
+            // Picked on a song's switch, Video or Song sticks for videos too, as their own
+            // switch does.
+            Action::SongVideo(video) => {
+                self.show_video = video;
+                if video {
+                    self.play_music_video();
+                } else {
+                    self.play_listed_upload();
                 }
             }
             Action::Seek(secs) => {
@@ -140,8 +181,18 @@ impl App {
                     self.toast("Sign in to like songs");
                     return;
                 }
-                // Optimistic: update the like state and the cached Liked songs list now.
-                self.set_liked(std::slice::from_ref(&t), like);
+                if !like && self.unliking_soon(&t.id) {
+                    return;
+                }
+                let restored = self.rating(|id| like && id == t.id);
+                if !like && self.liked.contains(&t.id) {
+                    let send = Req::Unlike(t.id.clone());
+                    return self.unlike_soon(vec![t], send);
+                }
+                // Keep the original taste order when a re-like undid the pending unlike.
+                if !restored {
+                    self.set_liked(std::slice::from_ref(&t), like);
+                }
                 self.backend.request(Req::Like { video_id: t.id, like });
             }
             Action::LikeMany(tracks, like) => {
@@ -149,36 +200,42 @@ impl App {
                     self.toast("Sign in to like songs");
                     return;
                 }
+                if like {
+                    self.rating(|id| tracks.iter().any(|t| t.id == id));
+                }
                 let tracks: Vec<Track> = tracks.into_iter().filter(|t| self.liked.contains(&t.id) != like).collect();
                 if tracks.is_empty() { return; }
-                if like {
-                    self.set_liked(&tracks, true);
-                } else {
-                    // Unlikes go a few a second (YouTube Music drops faster ones): each song
-                    // leaves the list when its unlike goes through, not all at once.
-                    self.unliking.extend(tracks.iter().map(|t| (t.id.clone(), t.clone())));
+                if !like {
+                    let send = Req::LikeMany { video_ids: tracks.iter().map(|t| t.id.clone()).collect(), like };
+                    return self.unlike_soon(tracks, send);
                 }
+                self.set_liked(&tracks, true);
                 if tracks.len() > 10 {
                     // One at a time, then checked: a few hundred take a few minutes.
-                    self.toast(format!("{} {} songs…", if like { "Liking" } else { "Removing likes from" }, tracks.len()));
+                    self.toast(format!("Liking {} songs…", tracks.len()));
                 }
                 self.backend.request(Req::LikeMany { video_ids: tracks.into_iter().map(|t| t.id).collect(), like });
-            }
-            Action::Dislike(t) => {
-                if !self.logged_in { self.toast("Sign in to rate songs"); return; }
-                self.set_liked(std::slice::from_ref(&t), false);
-                self.backend.request(Req::Dislike(t.id));
             }
             Action::Share(target) => {
                 self.share_pending = Some(share_url(&target));
                 self.toast("Link copied");
             }
+            Action::Pin(id, on) => {
+                self.pinned.retain(|p| *p != id);
+                if on {
+                    self.pinned.insert(0, id);
+                }
+            }
             Action::Download(track) => {
                 self.toast(format!("Downloading \u{201c}{}\u{201d}", track.title));
                 // The song version playing for a music video: that video plays the file too.
-                let for_video = if self.playing_as().is_some_and(|s| s.id == track.id) { self.current_id().map(str::to_owned) } else { None };
+                let for_video = if self.playing_as().is_some_and(|s| s.id == track.id && !s.has_video()) { self.current_id().map(str::to_owned) } else { None };
                 self.backend.request(Req::Download { track, for_video });
             }
+            Action::DownloadMany(target, title, tracks) => {
+                self.backend.request(Req::DownloadMany { target, title, tracks, confirmed: false });
+            }
+            Action::CancelDownload(key) => self.backend.cancel_downloads(&key),
             Action::AddToPlaylist(tracks) => {
                 if self.logged_in { self.dialog = Some(Dialog::PickPlaylist(tracks)); }
                 else { self.toast("Sign in to edit playlists"); }
@@ -194,12 +251,14 @@ impl App {
                 }
                 let items: Vec<(String, String)> = rows.iter().map(|&i| (c.tracks[i].id.clone(), c.set_ids[i].clone().unwrap_or_default())).collect();
                 let playlist = c.id.clone();
-                // Optimistic: drop the rows now; the playlist reloads once YouTube confirms.
+                let taken = lists::taken(c, &rows);
+                // Optimistic: drop the rows now. YouTube Music is told once the Undo is gone,
+                // and the playlist reloads when it confirms.
                 c.remove_rows(&rows);
                 log::debug!("list {playlist}: removing {} entries", items.len());
                 self.lists.edits.remove(&playlist, items.iter().map(|(_, set)| set.clone()));
                 self.selection.clear();
-                self.backend.request(Req::RemoveFromPlaylist { playlist_id: playlist, items });
+                self.toast_undo("Removed from playlist", Undo::Removal { id: playlist, rows: taken });
             }
             Action::NewPlaylist(tracks) => {
                 if self.logged_in { self.dialog = Some(Dialog::NewPlaylist { title: String::new(), tracks }); }
@@ -211,6 +270,10 @@ impl App {
                         id: c.id.clone(), title: c.title.clone(), description: c.description.clone().unwrap_or_default(), privacy: None,
                     });
                 }
+            }
+            Action::SortPlaylist(id, actions) => {
+                self.sorting.insert(id.clone(), super::lists::SortWait::new(actions.clone()));
+                self.backend.request(Req::SortPlaylist { id, actions });
             }
             Action::Collaborate => {
                 if let Some(id) = self.current_collection().filter(|c| !c.is_album && c.owned).map(|c| c.id.clone()) {
@@ -227,15 +290,18 @@ impl App {
                 if self.logged_in { self.backend.request(Req::SaveCollection { id, save }); }
                 else { self.toast("Sign in to save to library"); }
             }
-            Action::HomeChip(params) => {
-                self.home_loading = true;
-                if let Some(h) = &mut self.home {
-                    h.shelves.clear();
-                    for c in &mut h.chips {
-                        c.selected = false;
-                    }
+            Action::Subscribe(on) => {
+                if !self.logged_in {
+                    self.toast("Sign in to subscribe");
+                } else if let Some(a) = self.artist.as_mut().filter(|a| a.subscribed != on)
+                    && let Some(channel_id) = a.channel_id.clone()
+                    // One at a time, and not queued: the pill is greyed out while one runs.
+                    && self.subscriptions.start(&channel_id, on)
+                {
+                    // Shown at once; put back if YouTube Music refuses it.
+                    a.subscribed = on;
+                    self.backend.request(Req::Subscribe { channel_id, on });
                 }
-                self.backend.request(Req::Home(params));
             }
             Action::OpenNowPlaying(open) => {
                 if self.current().is_some() {
@@ -260,12 +326,29 @@ impl App {
                 let listed = self.current_id().map(str::to_owned);
                 let playing = self.playing_track().map(|t| t.id.clone()).or(listed.clone());
                 let Some(id) = playing else { return };
-                let at = self.audio.status.position();
                 self.backend.upgrade_quality(&id);
                 if let Some(listed) = listed.filter(|l| l != &id) {
                     self.backend.upgrade_quality(&listed);
                 }
-                self.play_current_at(at, false);
+                // An upgrade can come from any music source that's on, not just the
+                // custom addon URLs: Monochrome servers the listener added, Monochrome's
+                // own streamer, or JioSaavn all take over in place the same way. The
+                // Addons row counts only when it's on and has at least one enabled link.
+                let addons_ready = self.addons_on && self.hires_sources.iter().enumerate().any(|(i, s)| {
+                    !s.trim().is_empty() && self.hires_enabled.get(i).copied().unwrap_or(true)
+                });
+                let any_upgrade_source = addons_ready || self.mono_servers_on || self.monochrome || self.jiosaavn;
+                if !any_upgrade_source {
+                    self.toast("No music source is set to upgrade from. Add one in Settings \u{203a} Music sources first.");
+                } else if self.audio_info.is_none() && self.audio.status.wanted_gen.load(std::sync::atomic::Ordering::Relaxed) == self.generation {
+                    // Ask for the stream that is playing, in place. The backend reports the
+                    // attempt either way, so nothing here claims success on its own.
+                    self.upgrade_asked = true;
+                    self.backend.try_upgrade_active(self.generation, self.playing_track().cloned());
+                } else {
+                    let at = self.audio.status.position();
+                    self.play_current_at(at, false);
+                }
             }
         }
     }
@@ -277,9 +360,10 @@ impl App {
             keybinds::capture_dialog(self, ctx);
             return;
         }
+        palette::shortcut(self, ctx);
         let keys = &self.keybinds.bindings;
         use keybinds::Cmd;
-        let (space, back, fwd, next, prev, seek_bwd, seek_fwd, lyr, queue, np, full, search, vol_up, vol_down, mini) = (
+        let (space, back, fwd, next, prev, seek_bwd, seek_fwd, lyr, queue, np, full, search, vol_up, vol_down, mute, mini) = (
             keys.matches(Cmd::TogglePlay, ctx),
             keys.matches(Cmd::Back, ctx) || ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1)),
             keys.matches(Cmd::Forward, ctx) || ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2)),
@@ -287,17 +371,30 @@ impl App {
             keys.matches(Cmd::Prev, ctx),
             keys.matches(Cmd::SeekBackward, ctx),
             keys.matches(Cmd::SeekForward, ctx),
-            keys.matches(Cmd::Lyrics, ctx),
-            keys.matches(Cmd::Queue, ctx),
+            // Once per press, like the toggles below: L and Q flip their panel, and
+            // holding the key doesn't flip back and forth.
+            keys.matches_once(Cmd::Lyrics, ctx),
+            keys.matches_once(Cmd::Queue, ctx),
             keys.matches(Cmd::NowPlaying, ctx),
-            keys.matches(Cmd::FullScreen, ctx),
+            keys.matches(Cmd::FullScreen, ctx) || ctx.input(|i| i.key_pressed(egui::Key::F11)),
             keys.matches(Cmd::Search, ctx),
             keys.matches(Cmd::VolumeUp, ctx),
             keys.matches(Cmd::VolumeDown, ctx),
             // Once per press: holding it doesn't flip back and forth.
+            keys.matches_once(Cmd::Mute, ctx),
             keys.matches_once(Cmd::MiniPlayer, ctx),
         );
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        // Quits for real, with Close to tray on too: GNOME has no tray to quit from (#143).
+        let quit = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Q));
+        if quit {
+            self.quit(ctx);
+        }
+        // The toast's Undo. With Shift it would be redo, which there isn't.
+        let undo = !ctx.text_edit_focused() && ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z));
+        if undo && self.undo.is_some() {
+            self.actions.push(Action::Undo);
+        }
         if mini {
             self.actions.push(Action::Mini(!self.mini.target()));
         }
@@ -319,13 +416,16 @@ impl App {
         if prev {
             self.prev();
         }
+        // L and Q toggle, the trip the comments menu item makes: with their panel
+        // already up they fold it back to the artwork instead of reopening it.
         if lyr && self.current().is_some() {
-            self.np_open = true;
-            self.np_tab = NpTab::Lyrics;
+            self.toggle_lyrics();
         }
-        if queue && self.current().is_some() {
-            self.np_open = true;
-            self.np_tab = NpTab::UpNext;
+        // Q makes the trip the player bar's queue button makes: in now playing the
+        // Up next panel, elsewhere the sidebar's queue — outside the view it used to
+        // drag the whole now playing up for the queue alone.
+        if queue {
+            self.toggle_queue();
         }
         // F opens and closes the now playing view; Shift+F is the player full screen
         // (opening now playing first when it isn't up, since the full screen is its view).
@@ -336,12 +436,7 @@ impl App {
             }
         }
         if full && self.current().is_some() {
-            if !self.np_open {
-                self.np_open = true;
-                self.set_fullscreen(ctx, true);
-            } else {
-                self.set_fullscreen(ctx, !self.fullscreen);
-            }
+            self.toggle_fullscreen(ctx);
         }
         if search {
             // From any page: the Search page opens, and its box takes the typing. (On
@@ -372,6 +467,54 @@ impl App {
             let v = (self.audio.volume() + if vol_up { 0.05 } else { -0.05 }).clamp(0.0, 1.0);
             self.audio.set_volume(v);
         }
+        // M, like the player bar's speaker: the volume it was at comes back on unmute.
+        if mute {
+            super::shell::toggle_mute(self, ctx);
+        }
+    }
+
+    /// Now playing with its lyrics, or back out of it (L): with the panel already up
+    /// it folds back to the artwork instead of reopening it.
+    pub(super) fn toggle_lyrics(&mut self) {
+        if self.current().is_some() {
+            if self.np_open && self.np_tab == NpTab::Lyrics {
+                self.np_tab = NpTab::Art;
+            } else {
+                self.np_open = true;
+                self.np_tab = NpTab::Lyrics;
+            }
+        }
+    }
+
+    /// Full screen in now playing, or out of it (Shift+F): opening now playing first
+    /// when it isn't up, since the full screen is its view. With a video on show, full
+    /// screen is the video's, as F is on YouTube.
+    pub(super) fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        if !self.np_open {
+            self.np_open = true;
+            self.set_fullscreen(ctx, true);
+        } else if self.fullscreen {
+            self.set_fullscreen(ctx, false);
+        } else if self.shown_video().is_some() {
+            self.set_video_fullscreen(ctx, true);
+        } else {
+            self.set_fullscreen(ctx, true);
+        }
+    }
+
+    /// In now playing the queue is its Up next panel; elsewhere, the side panel.
+    pub(super) fn queue_shown(&self) -> bool {
+        if self.np_open { self.np_tab == NpTab::UpNext } else { self.queue_open }
+    }
+
+    /// The player bar's queue button: in now playing its Up next panel, elsewhere the
+    /// side drawer.
+    pub(super) fn toggle_queue(&mut self) {
+        if self.np_open {
+            self.np_tab = if self.queue_shown() { NpTab::Art } else { NpTab::UpNext };
+        } else {
+            self.queue_open = !self.queue_open;
+        }
     }
 
     /// Into the mini player or back. Full screen ends first, a frame ahead.
@@ -389,8 +532,16 @@ impl App {
         self.mini.toggle(ctx, now, video);
     }
 
+    /// Full screen with just the video, as on YouTube. Leaving it is leaving full screen.
+    pub(super) fn set_video_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        self.set_fullscreen(ctx, on);
+        self.video_full = on;
+        super::nowplaying::wake_video_controls(ctx);
+    }
+
     pub(super) fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
         self.fullscreen = on;
+        self.video_full = false;
         // Windows: in one step, without winit's unthemed-frame flash.
         if !crate::fullscreen::set(on) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
@@ -405,6 +556,89 @@ fn share_url(target: &Target) -> String {
         Target::Playlist(id) => format!("https://music.youtube.com/playlist?list={}", crate::ytm::list_id(id)),
         Target::Album(id) => format!("https://music.youtube.com/browse/{id}"),
         Target::Artist(id) => format!("https://music.youtube.com/channel/{id}"),
+    }
+}
+
+/// Subscribing and unsubscribing from artist pages: one at a time, and what each settled,
+/// so an artist page asked for before a change can't undo it.
+#[derive(Default)]
+pub(super) struct Subscriptions {
+    /// The one under way: its channel, and whether it subscribes.
+    running: Option<(String, bool)>,
+    /// Each channel's last change: where it stands, and when YouTube Music answered.
+    settled: HashMap<String, (bool, Instant)>,
+}
+
+impl Subscriptions {
+    pub(super) fn busy(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// Starts one, unless another is under way.
+    pub(super) fn start(&mut self, channel: &str, on: bool) -> bool {
+        if self.busy() {
+            return false;
+        }
+        self.running = Some((channel.to_owned(), on));
+        true
+    }
+
+    /// Its answer, which lets the next one go: where the channel now stands.
+    pub(super) fn finish(&mut self, channel: &str, on: bool, ok: bool) -> bool {
+        self.running = None;
+        let now = on == ok;
+        self.settled.insert(channel.to_owned(), (now, Instant::now()));
+        now
+    }
+
+    /// Whether an artist page asked for at `asked` shows the channel subscribed: as the
+    /// page says, unless a change under way, or answered since, says otherwise.
+    pub(super) fn shown(&self, channel: &str, says: bool, asked: Instant) -> bool {
+        match (&self.running, self.settled.get(channel)) {
+            (Some((c, on)), _) if c == channel => *on,
+            (_, Some(&(on, at))) if asked < at => on,
+            _ => says,
+        }
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    #[test]
+    fn one_at_a_time() {
+        let mut s = Subscriptions::default();
+        assert!(s.start("UCa", true));
+        assert!(s.busy());
+        assert!(!s.start("UCa", false), "a click while one runs does nothing");
+        assert!(!s.start("UCb", true));
+        assert!(s.finish("UCa", true, true));
+        assert!(!s.busy());
+        assert!(s.start("UCb", true));
+        // A failure lets the next one go too, and puts the old state back.
+        assert!(!s.finish("UCb", true, false));
+        assert!(!s.busy());
+    }
+
+    #[test]
+    fn earlier_pages_dont_undo_a_change() {
+        let mut s = Subscriptions::default();
+        let before = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        assert!(s.shown("UCa", true, before), "nothing changed here: the page says");
+        s.start("UCa", true);
+        // Under way: what was asked, whenever the page was fetched.
+        assert!(s.shown("UCa", false, before));
+        assert!(s.shown("UCa", false, Instant::now()));
+        assert!(!s.shown("UCb", false, before), "another channel: the page says");
+        s.finish("UCa", true, true);
+        assert!(s.shown("UCa", false, before), "asked before the answer: the answer stands");
+        let after = Instant::now() + Duration::from_secs(1);
+        assert!(!s.shown("UCa", false, after), "asked after it: the page says");
+        // A refused unsubscribe leaves it subscribed, over a page from before it.
+        s.start("UCa", false);
+        s.finish("UCa", false, false);
+        assert!(s.shown("UCa", false, before));
     }
 }
 

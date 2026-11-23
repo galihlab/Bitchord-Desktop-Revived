@@ -303,11 +303,11 @@ impl Api {
 
     /// POST `body` to `/youtubei/v1/<endpoint>`. `auth`: as the signed-in account, when
     /// there is one; otherwise anonymously as the visitor.
-    pub async fn call(&self, endpoint: &str, body: Value, auth: bool) -> anyhow::Result<Value> {
+    pub async fn call(&self, endpoint: &str, mut body: Value, auth: bool) -> anyhow::Result<Value> {
         let account = if auth { self.account() } else { None };
-        match self.call_once(endpoint, &body, account.as_deref(), false).await {
-            Err(e) if account.is_none() && is_retryable(&e) => self.retry_anonymous(endpoint, &body, e).await,
-            Err(e) if account.is_some() && is_refused(&e) => self.retry_signed_in(endpoint, &body, account.as_deref(), e).await,
+        match self.call_once(endpoint, &mut body, account.as_deref(), false).await {
+            Err(e) if account.is_none() && is_retryable(&e) => self.retry_anonymous(endpoint, &mut body, e).await,
+            Err(e) if account.is_some() && is_refused(&e) => self.retry_signed_in(endpoint, &mut body, account.as_deref(), e).await,
             r => r,
         }
     }
@@ -325,9 +325,9 @@ impl Api {
         self.call_as(endpoint, body, &account.on_channel(None)).await
     }
 
-    async fn call_as(&self, endpoint: &str, body: Value, account: &Session) -> anyhow::Result<Value> {
-        match self.call_once(endpoint, &body, Some(account), false).await {
-            Err(e) if is_refused(&e) => self.retry_signed_in(endpoint, &body, Some(account), e).await,
+    async fn call_as(&self, endpoint: &str, mut body: Value, account: &Session) -> anyhow::Result<Value> {
+        match self.call_once(endpoint, &mut body, Some(account), false).await {
+            Err(e) if is_refused(&e) => self.retry_signed_in(endpoint, &mut body, Some(account), e).await,
             r => r,
         }
     }
@@ -351,7 +351,7 @@ impl Api {
     /// fresh visitor ID and client version only when the request itself looks stale
     /// (400) or for the last try. Reading the page (about 1 MB, one at a time) for every
     /// refusal held a whole transfer up.
-    async fn retry_anonymous(&self, endpoint: &str, body: &Value, e: anyhow::Error) -> anyhow::Result<Value> {
+    async fn retry_anonymous(&self, endpoint: &str, body: &mut Value, e: anyhow::Error) -> anyhow::Result<Value> {
         let mut last = e;
         for (i, wait) in [500, 1_500, 3_000].into_iter().enumerate() {
             let stale = last.downcast_ref::<ApiError>().is_some_and(|a| a.status == 400);
@@ -370,7 +370,7 @@ impl Api {
     /// later. A refused request changed nothing, so it's safe to send again: up to three
     /// more times, 0.7, 2 and 4 s apart (a little jitter so parallel ones don't line up),
     /// as yt-dlp retries; longer only if they're all being refused (`refused`).
-    async fn retry_signed_in(&self, endpoint: &str, body: &Value, account: Option<&Session>, e: anyhow::Error) -> anyhow::Result<Value> {
+    async fn retry_signed_in(&self, endpoint: &str, body: &mut Value, account: Option<&Session>, e: anyhow::Error) -> anyhow::Result<Value> {
         let mut last = e;
         for wait in [700, 2_000, 4_000] {
             log::debug!("{endpoint}: {last:#}; trying again");
@@ -383,7 +383,7 @@ impl Api {
         Err(last)
     }
 
-    async fn call_once(&self, endpoint: &str, body: &Value, account: Option<&Session>, fresh: bool) -> anyhow::Result<Value> {
+    async fn call_once(&self, endpoint: &str, body: &mut Value, account: Option<&Session>, fresh: bool) -> anyhow::Result<Value> {
         let mut web = self.web(fresh).await;
         if account.is_some() {
             self.wait_if_paused().await;
@@ -401,8 +401,9 @@ impl Api {
             web.visitor_data = v;
         }
         anyhow::ensure!(!self.unavailable.load(Relaxed), Unavailable);
-        let mut payload = body.clone();
-        payload["context"] = json!({
+        // The context goes into the body in place: the caller hands it over owned, and a
+        // retry just overwrites it (the fields it holds are re-read each attempt).
+        body["context"] = json!({
             "client": {
                 "clientName": "WEB_REMIX",
                 "clientVersion": web.version,
@@ -418,7 +419,7 @@ impl Api {
             "user": {"lockedSafetyMode": false},
         });
         if self.restricted.load(std::sync::atomic::Ordering::Relaxed) {
-            payload["context"]["user"]["enableSafetyMode"] = true.into();
+            body["context"]["user"]["enableSafetyMode"] = true.into();
         }
         let mut req = crate::proxy::http()
             .post(format!("{ORIGIN}/youtubei/v1/{endpoint}?prettyPrint=false"))
@@ -436,7 +437,7 @@ impl Api {
             Some(a) => a.sign(req, ORIGIN)?,
             None => req.header("Cookie", CONSENT),
         };
-        let resp = req.json(&payload).send().await?;
+        let resp = req.json(&*body).send().await?;
         if let Some(a) = account {
             self.keep(a, resp.headers().get_all("set-cookie").iter().filter_map(|c| c.to_str().ok()));
         }
@@ -580,6 +581,12 @@ fn now_secs() -> u64 {
 }
 
 /// The text between `start` and the next `end`.
+/// The signed-in session itself was turned away (signed out, or refused even after the
+/// retries): a page anyone can see may still come asked signed out.
+pub fn session_refused(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ApiError>().is_some_and(|a| a.status == 401 || a.status == 403)
+}
+
 fn is_refused(e: &anyhow::Error) -> bool {
     e.downcast_ref::<ApiError>().is_some_and(is_throttled)
 }
@@ -645,6 +652,17 @@ fn utc_offset_minutes() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_refusals() {
+        let api = |status| anyhow::Error::new(ApiError { status, msg: String::new() });
+        assert!(session_refused(&api(401)));
+        assert!(session_refused(&api(403)));
+        // Not about the session: asking signed out wouldn't help.
+        assert!(!session_refused(&api(400)));
+        assert!(!session_refused(&api(500)));
+        assert!(!session_refused(&anyhow::anyhow!("YouTube Music returned an empty artist page")));
+    }
 
     #[test]
     fn stray_refusals_dont_pause_everything() {

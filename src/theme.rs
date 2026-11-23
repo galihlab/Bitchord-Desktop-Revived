@@ -49,6 +49,27 @@ pub fn on_text() -> Color32 {
     if light() { Color32::WHITE } else { Color32::from_gray(15) }
 }
 
+/// Relative luminance of an opaque colour, as WCAG words it.
+fn luminance(c: Color32) -> f32 {
+    let lin = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// WCAG contrast between two opaque colours.
+fn contrast(a: Color32, b: Color32) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// Text and icons on a fill of this colour: dark or white, whichever reads better.
+pub fn on_fill(fill: Color32) -> Color32 {
+    let dark = Color32::from_gray(15);
+    if contrast(dark, fill) > contrast(Color32::WHITE, fill) { dark } else { Color32::WHITE }
+}
+
 /// Least important text: counts, hints, placeholders.
 pub fn text_faint() -> Color32 {
     if light() { TEXT_FAINT_LIGHT } else { TEXT_FAINT }
@@ -139,8 +160,45 @@ impl Appearance {
     }
 }
 
-/// Windows' "app mode" (Settings › Personalization › Colors), read again every couple
-/// of seconds so switching it there shows without a restart. `None` off Windows.
+/// Settings › Appearance › Visual preset: a bundle of the visual settings beneath it,
+/// for older computers (Barebones) or everything at once (High visual). Custom is
+/// whatever the listener set by hand — also what a bundle becomes the moment one of
+/// its settings is changed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum VisualPreset {
+    #[default]
+    Custom,
+    Barebones,
+    High,
+}
+
+impl VisualPreset {
+    pub const ALL: [Self; 3] = [Self::Custom, Self::Barebones, Self::High];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Custom => "Custom",
+            Self::Barebones => "Barebones",
+            Self::High => "High visual",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Custom => "custom",
+            Self::Barebones => "barebones",
+            Self::High => "high",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        Self::ALL.into_iter().find(|v| v.key() == s).unwrap_or_default()
+    }
+}
+
+/// Windows' "app mode" (Settings › Personalization › Colors), read again every couple of
+/// seconds so switching it there shows without a restart. `None` when it can't be told.
+#[cfg(windows)]
 fn system_light() -> Option<bool> {
     use std::time::{Duration, Instant};
     static MODE: std::sync::Mutex<Option<(Instant, Option<bool>)>> = std::sync::Mutex::new(None);
@@ -169,8 +227,117 @@ fn read_system_light() -> Option<bool> {
     }
 }
 
-#[cfg(not(windows))]
-fn read_system_light() -> Option<bool> {
+/// The Linux desktop's light or dark style, as `follow_system_scheme` last heard it.
+#[cfg(target_os = "linux")]
+fn system_light() -> Option<bool> {
+    match SCHEME.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+/// 0: no answer (yet), 1: dark, 2: light.
+#[cfg(target_os = "linux")]
+static SCHEME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(target_os = "linux")]
+const SETTINGS: &str = "org.freedesktop.portal.Settings";
+#[cfg(target_os = "linux")]
+const APPEARANCE: (&str, &str) = ("org.freedesktop.appearance", "color-scheme");
+
+/// Follow the desktop's light or dark style, from the settings portal's `color-scheme`
+/// (GNOME, KDE and others): the window can't tell on Wayland. A thread of its own hears
+/// each change the moment the desktop makes it and `wake`s the UI to draw it (an idle
+/// window draws nothing otherwise). Waits a moment for the first answer, so the first
+/// frame already has the desktop's style.
+#[cfg(target_os = "linux")]
+pub fn follow_system_scheme(wake: impl Fn() + Copy + Send + 'static) {
+    use dbus::arg::{RefArg, Variant};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let gnome = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|d| d.eq_ignore_ascii_case("GNOME")));
+    let set = move |v: Option<u64>| {
+        let s = scheme(v, gnome);
+        if SCHEME.swap(s, Ordering::Relaxed) != s {
+            wake();
+        }
+    };
+    let (asked, answer) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().name("color-scheme".into()).spawn(move || {
+        let Ok(bus) = dbus::blocking::Connection::new_session() else { return };
+        let portal = bus.with_proxy("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", Duration::from_secs(2));
+        // Listening before the first read, so a change between the two isn't missed.
+        let rule = dbus::message::MatchRule::new_signal(SETTINGS, "SettingChanged").with_path("/org/freedesktop/portal/desktop");
+        let heard = bus
+            .add_match(rule, move |(namespace, key, v): (String, String, Variant<Box<dyn RefArg>>), _, _| {
+                if (namespace.as_str(), key.as_str()) == APPEARANCE {
+                    set(variant_number(&v));
+                }
+                true
+            })
+            .is_ok();
+        let first = portal_color_scheme(&portal);
+        set(first);
+        let _ = asked.send(());
+        // No portal, or one without the setting: nothing more to learn from it.
+        if first.is_none() {
+            return;
+        }
+        // Asked again now and then too: a portal that restarts doesn't tell what changed
+        // while it was gone. Every couple of seconds if it can't be listened to.
+        let every = Duration::from_secs(if heard { 30 } else { 2 });
+        let mut read = Instant::now();
+        loop {
+            match every.checked_sub(read.elapsed()) {
+                Some(left) => {
+                    if bus.process(left).is_err() {
+                        return;
+                    }
+                }
+                None => {
+                    if let Some(v) = portal_color_scheme(&portal) {
+                        set(Some(v));
+                    }
+                    read = Instant::now();
+                }
+            }
+        }
+    });
+    if spawned.is_ok() {
+        let _ = answer.recv_timeout(Duration::from_millis(250));
+    }
+}
+
+/// `SCHEME` for the portal's `color-scheme`: 0 no preference, 1 dark, 2 light. GNOME's
+/// light style is its "default", which elsewhere means no preference.
+#[cfg(target_os = "linux")]
+fn scheme(color_scheme: Option<u64>, gnome: bool) -> u8 {
+    match color_scheme {
+        Some(1) => 1,
+        Some(2) => 2,
+        Some(0) if gnome => 2,
+        _ => 0,
+    }
+}
+
+/// `org.freedesktop.appearance` `color-scheme`. Older portals have only `Read`, which
+/// wraps the value in a second variant.
+#[cfg(target_os = "linux")]
+fn portal_color_scheme(portal: &dbus::blocking::Proxy<&dbus::blocking::Connection>) -> Option<u64> {
+    use dbus::arg::{RefArg, Variant};
+    let (v,): (Variant<Box<dyn RefArg>>,) = portal.method_call(SETTINGS, "ReadOne", APPEARANCE).or_else(|_| portal.method_call(SETTINGS, "Read", APPEARANCE)).ok()?;
+    variant_number(&v)
+}
+
+/// The number in a variant, however many variants deep.
+#[cfg(target_os = "linux")]
+fn variant_number(a: &dyn dbus::arg::RefArg) -> Option<u64> {
+    a.as_u64().or_else(|| a.as_iter()?.next().and_then(variant_number))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn system_light() -> Option<bool> {
     None
 }
 
@@ -272,19 +439,38 @@ pub fn ease_in_out(t: f32) -> f32 {
 /// for how snappy the app feels. (Lyrics keep their own timing.)
 pub const SPEED: f32 = 0.65;
 
+/// Reduce motion (Settings › Appearance): 1.0 normally, 0.0 when every transition
+/// should land at once. egui takes a zero animation time as "no transition".
+static MOTION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1.0f32.to_bits());
+
+pub fn set_motion(on: bool) {
+    MOTION.store((on as u32 as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The fraction transitions run at: [`SPEED`], or nothing at all with Reduce motion on.
+pub fn speed() -> f32 {
+    SPEED * f32::from_bits(MOTION.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Animate toward `target` (eased), keyed by `id`. Requests repaints while moving.
 pub fn anim(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, target: f32, secs: f32) -> f32 {
-    ctx.animate_value_with_time(egui::Id::unique(id), target, secs * SPEED)
+    ctx.animate_value_with_time(egui::Id::unique(id), target, secs * speed())
 }
 
 pub fn anim_bool(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, on: bool, secs: f32) -> f32 {
-    ease_out(ctx.animate_bool_with_time(egui::Id::unique(id), on, secs * SPEED))
+    ease_out(ctx.animate_bool_with_time(egui::Id::unique(id), on, secs * speed()))
 }
 
 /// [`anim_bool`] for a transition whose length the theme sets itself, so `ui_fade_secs`
 /// leaves it alone (BitChord's `anim_bool` carries no such fade yet: the two agree).
 pub fn anim_bool_timed(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, on: bool, secs: f32) -> f32 {
-    ease_out(ctx.animate_bool_with_time(egui::Id::unique(id), on, secs * SPEED))
+    ease_out(ctx.animate_bool_with_time(egui::Id::unique(id), on, secs * speed()))
+}
+
+/// [`anim_bool`] that eases in and out, for a fold that opens and closes (Discord's
+/// settings): the change of direction should never read as a snap.
+pub fn anim_bool_soft(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, on: bool, secs: f32) -> f32 {
+    ease_in_out(ctx.animate_bool_with_time(egui::Id::unique(id), on, secs * speed()))
 }
 
 // ------------------------------------------------------------------ type
@@ -323,12 +509,14 @@ pub mod icon {
     pub const SKIP_BACK: char = '\u{e15f}';
     pub const SKIP_FORWARD: char = '\u{e160}';
     pub const SHUFFLE: char = '\u{e15e}';
+    pub const REPEAT: char = '\u{e146}';
+    pub const REPEAT_1: char = '\u{e1fd}';
     pub const VOLUME_2: char = '\u{e1ab}';
     pub const VOLUME_1: char = '\u{e1aa}';
     pub const VOLUME_X: char = '\u{e1ac}';
     pub const HEART: char = '\u{e0f2}';
-    pub const THUMBS_DOWN: char = '\u{e189}';
     pub const LIST_MUSIC: char = '\u{e2e0}';
+    pub const MIC_VOCAL: char = '\u{e349}';
     pub const X: char = '\u{e1b2}';
     pub const HISTORY: char = '\u{e1f5}';
     pub const TRASH_2: char = '\u{e18e}';
@@ -337,7 +525,6 @@ pub mod icon {
     pub const LIST_MINUS: char = '\u{e23e}';
     pub const LIST_CHECKS: char = '\u{e1d0}';
     pub const RADIO: char = '\u{e142}';
-    pub const DISC_3: char = '\u{e494}';
     pub const USER: char = '\u{e19f}';
     pub const SETTINGS: char = '\u{e154}';
     pub const LOG_OUT: char = '\u{e10e}';
@@ -402,10 +589,15 @@ const LYRIC_FONTS: &[(&str, [&[u8]; 3])] = &[
         include_bytes!("../assets/fonts/InstrumentSans-SemiBold.ttf"),
         include_bytes!("../assets/fonts/InstrumentSans-SemiBold.ttf"),
     ]),
+    ("jetbrainsnerd", [
+        include_bytes!("../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf"),
+        include_bytes!("../assets/fonts/JetBrainsMonoNerdFont-SemiBold.ttf"),
+        include_bytes!("../assets/fonts/JetBrainsMonoNerdFont-Bold.ttf"),
+    ]),
 ];
 
 /// The bundled faces, by the names the font setting shows and stores.
-pub const BUNDLED_FONTS: &[&str] = &["SF Pro Display", "Inter", "DM Sans", "Figtree", "Google Sans Flex", "Instrument Sans"];
+pub const BUNDLED_FONTS: &[&str] = &["SF Pro Display", "Inter", "DM Sans", "Figtree", "Google Sans Flex", "Instrument Sans", "JetBrains Mono Nerd"];
 
 /// The bundled font a preset font name refers to. Fonts that can't be bundled
 /// (Spotify's) map to the closest open one; unknown names to Inter.
@@ -416,6 +608,7 @@ fn lyric_key(name: &str) -> Option<&'static str> {
         "googlesansflex" | "googlesans" => "googlesansflex",
         "figtree" | "spotifymixuititle" | "spotifymix" | "circular" => "figtree",
         "switzer" | "instrumentsans" => "instrumentsans",
+        "jetbrainsmononerd" | "jetbrainsmononerdfont" | "jetbrainsnerd" | "jetbrainsnerdfont" => "jetbrainsnerd",
         _ => return None,
     })
 }
@@ -889,7 +1082,7 @@ pub fn install_style(ctx: &egui::Context) {
         s.text_styles.insert(egui::TextStyle::Small, regular(12.0));
         s.visuals = visuals();
         s.interaction.selectable_labels = false;
-        s.animation_time = 0.18 * SPEED;
+        s.animation_time = 0.18 * speed();
     });
 }
 
@@ -926,3 +1119,31 @@ fn visuals() -> egui::Visuals {
     v
 }
 
+
+#[cfg(test)]
+mod tests {
+    // Both tests are Linux's (the portal); on other systems there'd be nothing to use.
+    #[cfg(target_os = "linux")]
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_portals_color_scheme_reads_from_one_variant_or_two() {
+        use dbus::arg::{RefArg, Variant};
+        let once: Box<dyn RefArg> = Box::new(2u32);
+        let twice: Box<dyn RefArg> = Box::new(Variant(Box::new(1u32) as Box<dyn RefArg>));
+        assert_eq!(variant_number(&Variant(once)), Some(2));
+        assert_eq!(variant_number(&Variant(twice)), Some(1));
+        assert_eq!(variant_number(&Variant(Box::new("dark".to_owned()) as Box<dyn RefArg>)), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gnomes_default_style_is_light_and_no_preference_elsewhere() {
+        assert_eq!(scheme(Some(1), true), 1);
+        assert_eq!(scheme(Some(2), false), 2);
+        assert_eq!(scheme(Some(0), true), 2);
+        assert_eq!(scheme(Some(0), false), 0);
+        assert_eq!(scheme(None, true), 0);
+    }
+}

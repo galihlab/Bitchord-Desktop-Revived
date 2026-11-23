@@ -14,6 +14,10 @@ use crate::backend::Backend;
 
 /// A failed download is tried again when it's next needed after this long.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Bytes nobody has asked about for this long are dropped: a load whose widget is gone
+/// (scrolled away before its texture existed) would otherwise keep them for the session.
+/// The decoded copy of the same load is dropped with it, by the App's `sweep`.
+const KEEP_READY: Duration = Duration::from_secs(60);
 /// Thumbnails up to this size are also kept on disk, so the next launch shows them at
 /// once (the account picture, playlist covers, the home feed).
 const DISK_MAX_FILE: usize = 256 * 1024;
@@ -22,8 +26,22 @@ const DISK_BUDGET: u64 = 64 * 1024 * 1024;
 
 enum Entry {
     Pending,
-    Ready(Arc<[u8]>, Option<String>),
+    /// When it was last asked for.
+    Ready(Arc<[u8]>, Option<String>, Instant),
     Failed(String, Instant),
+}
+
+/// URIs whose bytes went stale, for the App to `forget_image`: the decoded copies
+/// egui's image loaders keep can only be reached through the context.
+static ABANDONED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Forgets everything the loaders still hold for images nobody has asked about — the
+/// decoded copies of abandoned loads. Called every frame; nothing to do almost always.
+pub fn sweep(ctx: &egui::Context) {
+    let abandoned = std::mem::take(&mut *ABANDONED.lock().unwrap());
+    for uri in abandoned {
+        ctx.forget_image(&uri);
+    }
 }
 
 fn is_http(uri: &str) -> bool {
@@ -34,6 +52,8 @@ pub struct HttpImages {
     backend: Backend,
     cache: Arc<Mutex<HashMap<String, Entry>>>,
     dir: std::path::PathBuf,
+    /// Local music's covers (see `local.rs`): read from their files, never fetched.
+    covers: std::path::PathBuf,
 }
 
 impl HttpImages {
@@ -41,7 +61,8 @@ impl HttpImages {
         let dir = backend.data_dir().join("thumbs");
         let _ = std::fs::create_dir_all(&dir);
         trim(&dir);
-        Self { backend, cache: Default::default(), dir }
+        let covers = backend.data_dir().join("local-covers");
+        Self { backend, cache: Default::default(), dir, covers }
     }
 }
 
@@ -81,12 +102,16 @@ impl BytesLoader for HttpImages {
     }
 
     fn load(&self, _ctx: &egui::Context, uri: &str) -> BytesLoadResult {
-        if !is_http(uri) {
+        // Local music's covers load by their own scheme (see `local.rs`); everything
+        // else here is a fetch.
+        let local = uri.strip_prefix(crate::local::COVER).map(str::to_owned);
+        if local.is_none() && !is_http(uri) {
             return Err(LoadError::NotSupported);
         }
         let mut cache = self.cache.lock().unwrap();
-        match cache.get(uri) {
-            Some(Entry::Ready(bytes, mime)) => {
+        match cache.get_mut(uri) {
+            Some(Entry::Ready(bytes, mime, asked)) => {
+                *asked = Instant::now();
                 return Ok(BytesPoll::Ready {
                     size: None,
                     bytes: Bytes::Shared(bytes.clone()),
@@ -103,12 +128,26 @@ impl BytesLoader for HttpImages {
         let (http, cache, uri, backend) =
             (self.backend.http(), self.cache.clone(), uri.to_owned(), self.backend.clone());
         let file = disk_path(&self.dir, &uri);
+        let local = local.and_then(|name| crate::local::cover_in(&self.covers, &name));
         self.backend.spawn(async move {
+            // A local cover is a file on this computer: read it, no fetch and no
+            // second copy in the thumbs cache (it already is on disk).
+            if let Some(path) = local {
+                let entry = match std::fs::read(&path) {
+                    Ok(bytes) => Entry::Ready(Arc::from(bytes), None, Instant::now()),
+                    Err(e) => Entry::Failed(e.to_string(), Instant::now()),
+                };
+                if let Some(slot) = cache.lock().unwrap().get_mut(&uri) {
+                    *slot = entry;
+                }
+                backend.wake();
+                return;
+            }
             if let Ok(bytes) = std::fs::read(&file) {
                 // Touch it, so trimming drops pictures that aren't used any more.
                 let _ = std::fs::File::options().write(true).open(&file).and_then(|f| f.set_modified(std::time::SystemTime::now()));
                 if let Some(slot) = cache.lock().unwrap().get_mut(&uri) {
-                    *slot = Entry::Ready(Arc::from(bytes), None);
+                    *slot = Entry::Ready(Arc::from(bytes), None, Instant::now());
                 }
                 backend.wake();
                 return;
@@ -128,7 +167,7 @@ impl BytesLoader for HttpImages {
                     if bytes.len() <= DISK_MAX_FILE {
                         let _ = std::fs::write(&file, &bytes);
                     }
-                    Entry::Ready(Arc::from(&bytes[..]), mime)
+                    Entry::Ready(Arc::from(&bytes[..]), mime, Instant::now())
                 }
                 Err(e) => Entry::Failed(e.to_string(), Instant::now()),
             };
@@ -155,7 +194,7 @@ impl BytesLoader for HttpImages {
             .unwrap()
             .values()
             .map(|e| match e {
-                Entry::Ready(b, _) => b.len(),
+                Entry::Ready(b, _, _) => b.len(),
                 _ => 0,
             })
             .sum()
@@ -163,6 +202,26 @@ impl BytesLoader for HttpImages {
 
     fn has_pending(&self) -> bool {
         self.cache.lock().unwrap().values().any(|e| matches!(e, Entry::Pending))
+    }
+
+    fn end_pass(&self, _pass_index: u64) {
+        // A texture, once it exists, forgets its bytes at once; what's still here is
+        // loading, or a load nobody's asked about lately (its widget went away before
+        // the texture was made). The decoded copy sits in egui's image loaders, which
+        // only the context can reach — the URIs land in `ABANDONED` for the App's sweep.
+        let mut abandoned = ABANDONED.lock().unwrap();
+        self.cache.lock().unwrap().retain(|uri, e| match e {
+            Entry::Pending => true,
+            Entry::Ready(.., asked) => {
+                let keep = asked.elapsed() < KEEP_READY;
+                if !keep {
+                    abandoned.push(uri.clone());
+                }
+                keep
+            }
+            // A failure's job is the retry wait; past it, a later ask just fetches again.
+            Entry::Failed(_, at) => at.elapsed() < RETRY_AFTER,
+        });
     }
 }
 
@@ -205,9 +264,10 @@ impl TextureLoader for Textures {
     }
 
     fn load(&self, ctx: &egui::Context, uri: &str, options: TextureOptions, size_hint: SizeHint) -> TextureLoadResult {
-        // Also the bundled theme covers and icon previews: egui's own loader would keep
-        // each one decoded, as well as its texture, until the app closes.
-        if !is_http(uri) && !uri.starts_with("bytes://theme-cover/") && !uri.starts_with("bytes://app-icon/") {
+        // Also the bundled theme covers, the icon previews and local music's covers:
+        // egui's own loader would keep each one decoded, as well as its texture, until
+        // the app closes.
+        if !is_http(uri) && !uri.starts_with(crate::local::COVER) && !uri.starts_with("bytes://theme-cover/") && !uri.starts_with("bytes://app-icon/") {
             return Err(LoadError::NotSupported);
         }
         {

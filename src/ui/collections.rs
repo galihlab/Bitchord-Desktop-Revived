@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use crate::backend::{Collection, Req};
-use crate::model::{ShelfKind, Target, Track};
+use crate::model::{Card, ShelfKind, Target, Track};
 
 use super::lists::{Arrival, Done, LIKED_MUSIC, Opened, Start};
 use super::queue::QueueFill;
@@ -84,12 +84,21 @@ impl App {
     /// reload asked for just before can still come back without them.)
     pub(super) fn set_liked(&mut self, tracks: &[Track], like: bool) {
         log::debug!("like={like}: {} songs, e.g. {:?}", tracks.len(), tracks.iter().take(3).map(|t| &t.id).collect::<Vec<_>>());
+        let store = !tracks.is_empty();
         for t in tracks {
             if like {
                 self.liked.insert(t.id.clone());
+                if !crate::local::is_local(&t.id) {
+                    // a like says more than a play; the taste keeps the newest fifty
+                    self.listening.liked(t.clone());
+                }
             } else {
                 self.liked.remove(&t.id);
+                self.listening.unliked(&t.id);
             }
+        }
+        if store {
+            self.listening.store(self.backend.data_dir());
         }
         self.lists.set_liked(tracks, like);
     }
@@ -132,15 +141,13 @@ impl App {
         if let Arrival::Done(done) = arrival {
             self.load_done(&id, done);
         }
-        // Its card's play button was pressed before it was here (in someone else's jam the host plays).
+        // Its card's play button was pressed before it was here.
         if let Some((Target::Playlist(p), shuffled)) = &self.play_pending
             && *p == id
         {
             let shuffled = *shuffled;
             self.play_pending = None;
-            if !self.jam.guest() {
-                self.play_opened(id, shuffled);
-            }
+            self.play_opened(id, shuffled);
         }
     }
 
@@ -192,7 +199,11 @@ impl App {
     /// The next songs of a playlist played before all of it was in join the queue.
     fn fill_queue(&mut self, id: &str, load: u64, tracks: Vec<Track>, more: bool) {
         let playing_it = self.queue_source == Some(Target::Playlist(id.to_owned()));
-        let Some(filled) = self.queue.fill_from(id, load, tracks, more, playing_it) else { return };
+        let saved = match &mut self.undo {
+            Some(super::undo::Undo::Queue(saved)) => Some(saved),
+            _ => None,
+        };
+        let Some(filled) = self.queue.fill_saved(saved, id, load, tracks, more, playing_it) else { return };
         if filled.ran_out {
             self.next();
         } else if filled.was_at_end && !self.buffering {
@@ -229,5 +240,35 @@ impl App {
             }
         }
         ids.into_iter().collect()
+    }
+}
+
+/// The playlist cards `order`ed (indices into `cards`), the `pinned` ones first in the
+/// order they're pinned in.
+pub(super) fn pinned_first(pinned: &[String], cards: &[Card], order: impl IntoIterator<Item = usize>) -> Vec<usize> {
+    let rank = |i: usize| match &cards[i].target {
+        Target::Playlist(id) => pinned.iter().position(|p| p == id),
+        _ => None,
+    };
+    let mut order: Vec<usize> = order.into_iter().collect();
+    // Stable: the rest keep their order.
+    order.sort_by_key(|&i| rank(i).unwrap_or(usize::MAX));
+    order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pinned_first;
+    use crate::model::{Card, Target};
+
+    #[test]
+    fn pinned_playlists_come_first() {
+        let card = |id: &str| Card { title: String::new(), subtitle: String::new(), thumbs: Vec::new(), target: Target::Playlist(id.into()), round: false, links: Vec::new() };
+        let cards = [card("a"), card("b"), card("c"), card("d")];
+        let pinned = ["d".to_owned(), "b".to_owned(), "gone".to_owned()];
+        assert_eq!(pinned_first(&pinned, &cards, 0..4), [3, 1, 0, 2]);
+        // Sorted some other way, the rest keep that order.
+        assert_eq!(pinned_first(&pinned, &cards, [2, 1, 0, 3]), [3, 1, 2, 0]);
+        assert_eq!(pinned_first(&[], &cards, 0..4), [0, 1, 2, 3]);
     }
 }

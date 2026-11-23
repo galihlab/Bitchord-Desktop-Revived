@@ -33,9 +33,11 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-/// The party server the web app and the phone use. `YTM_PARTY_SERVER` overrides it,
-/// and a custom server typed on the page wins over both.
-pub const DEFAULT_SERVER: &str = "https://bitchord.kushagrasingh.in";
+/// The party server the web app and the phone use: the API host, which answers the
+/// JSON the phone backend speaks (`bitchord.kushagrasingh.in` itself is the invite
+/// page and hands out HTML, not parties). `YTM_PARTY_SERVER` overrides it, and a
+/// custom server typed on the page wins over both.
+pub const DEFAULT_SERVER: &str = "https://api.bitchord.kushagrasingh.in";
 
 /// Party invite links (JamInviteLink.kt): `https://bitchord.kushagrasingh.in/invite/<CODE>`,
 /// optionally `?server=<custom server>`, and `bitchord://party/<CODE>`.
@@ -428,10 +430,6 @@ pub fn snapshot_of(raw: &Value) -> PartySnapshot {
     serde_json::from_value(raw.clone()).unwrap_or_default()
 }
 
-pub fn member_of(raw: &Value) -> PartyMember {
-    serde_json::from_value(raw.clone()).unwrap_or_default()
-}
-
 /// Where this device should be in the current track, right now, in ms; none without
 /// a track. Before the first pong it's the server's own reading at send time: a
 /// starting point, not a thing to seek to (wait for `clock_synced`).
@@ -631,8 +629,9 @@ pub fn device_id(data_dir: &Path) -> String {
 pub enum Event {
     /// A membership was adopted (created or joined): the party as it stands now.
     Adopted,
-    /// The socket is up or down again.
-    Connection(Connection),
+    /// The socket is up or down again. The connection's own state is read from
+    /// `State::connection`; this only says the UI should look again.
+    Connection,
     /// The party is over for this device: `reason` says why, empty when we left.
     Ended(String),
 }
@@ -740,12 +739,6 @@ impl Party {
         position_now(&state, self.inner.clock.offset.load(Ordering::Relaxed))
     }
 
-    /// How far ahead the party's next resume is scheduled (the play lead), or 0.
-    pub fn ms_until_start(&self) -> i64 {
-        let state = self.inner.state.lock().unwrap().clone();
-        ms_until_start(&state, self.inner.clock.offset.load(Ordering::Relaxed))
-    }
-
     /// Events since the last call.
     pub fn try_recv(&self) -> Option<Event> {
         self.events.try_recv().ok()
@@ -793,14 +786,6 @@ impl Party {
         self.send(json!({ "type": "control", "action": "seek", "positionMs": position_ms }));
     }
 
-    pub fn next(&self) {
-        self.send(json!({ "type": "control", "action": "next" }));
-    }
-
-    pub fn previous(&self) {
-        self.send(json!({ "type": "control", "action": "previous" }));
-    }
-
     pub fn set_track(&self, track: &PartyTrack, position_ms: i64, is_playing: bool) {
         self.send(json!({ "type": "control", "action": "setTrack", "track": track, "positionMs": position_ms, "isPlaying": is_playing }));
     }
@@ -815,22 +800,8 @@ impl Party {
         self.send(json!({ "type": "control", "action": "queueAdd", "tracks": tracks, "playNext": play_next }));
     }
 
-    pub fn queue_remove(&self, video_id: &str) {
-        self.send(json!({ "type": "control", "action": "queueRemove", "videoId": video_id }));
-    }
-
-    pub fn queue_clear(&self) {
-        self.send(json!({ "type": "control", "action": "queueClear" }));
-    }
-
     pub fn queue_move(&self, from_index: usize, to_index: usize) {
         self.send(json!({ "type": "control", "action": "queueMove", "fromIndex": from_index, "toIndex": to_index }));
-    }
-
-    pub fn set_max_members(&self, max_members: usize) {
-        self.send(
-            json!({ "type": "control", "action": "setMaxMembers", "maxMembers": max_members }),
-        );
     }
 
     pub fn kick(&self, member_id: &str) {
@@ -987,7 +958,7 @@ impl Inner {
             state.connection = Connection::Live;
             state.error = None;
         }
-        self.emit(Event::Connection(Connection::Live));
+        self.emit(Event::Connection);
         // A burst on arrival makes the first seconds accurate, then a trickle keeps
         // up with drift.
         let mut burst = PING_BURST;

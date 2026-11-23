@@ -2,10 +2,10 @@
 //! animated background. The lyrics themselves are drawn by `karaoke` (a port of the
 //! better-lyrics renderer); this adds their toolbar and the plain-text fallback.
 
-use egui::{Color32, Rect, Sense, Ui, Vec2, pos2, vec2};
+use egui::{Color32, Pos2, Rect, Sense, Ui, Vec2, pos2, vec2};
 
 use super::widgets::{self, named, text_at};
-use super::{Action, App, NpTab, Repeat, karaoke};
+use super::{Action, App, NpTab, Repeat, glyphs, karaoke};
 use crate::lyrics::{Lyrics, Sync, SyncKind};
 use crate::shader::Params;
 use crate::theme::{self, icon};
@@ -35,12 +35,18 @@ pub fn overlay(app: &mut App, ctx: &egui::Context, now: f64) {
     let rect = full.translate(vec2(0.0, full.height() * (1.0 - t)));
     let look = app.look();
     let b = &look.background;
+    let video_only = app.fullscreen && app.video_full;
+    let video_only = video_only.then(|| app.shown_video().cloned()).flatten();
     egui::Area::new(egui::Id::unique("now-playing"))
         .order(egui::Order::Middle)
         .fixed_pos(rect.min)
         .show(ctx, |ui| {
             // Swallow input so the page underneath doesn't react.
             ui.allocate_rect(rect, Sense::click_and_drag());
+            if let Some(video) = &video_only {
+                video_fullscreen(app, ui, rect, video, now);
+                return;
+            }
             // It covers the window's top too: that still moves the window.
             if !app.fullscreen {
                 super::titlebar::drag_area(ui, Rect::from_min_size(rect.min, vec2(rect.width(), super::titlebar::HEIGHT)), "now-playing");
@@ -87,7 +93,7 @@ pub fn overlay(app: &mut App, ctx: &egui::Context, now: f64) {
             }
             let k = b.scrim / 0.3;
             super::shell::vgradient(ui.painter(), rect, theme::shade((0.18 * k).min(0.95)), theme::shade((0.42 * k).min(0.95)));
-            if app.ambient_light && app.current().cloned().is_some_and(|track| app.video_mode(&track)) {
+            if app.ambient_light && app.shown_video().is_some() {
                 paint_glow(app, ui, rect);
             }
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(32.0, 20.0))));
@@ -117,11 +123,11 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
         Some(_) => app.shown().cloned().unwrap_or(track),
         None => track,
     };
-    let heard = if hold.is_some() { track.clone() } else { app.playing_track().cloned().unwrap_or_else(|| track.clone()) };
     let look = app.look();
     let cs = &look.cover;
     let area = ui.max_rect();
-    let video_mode = app.video_mode(&track);
+    let video = app.shown_video().cloned();
+    let video_mode = video.is_some();
     let no_lyrics = app.no_lyrics() || video_mode;
     // The content is this area less its margins: a cover column beside the panel needs
     // 860 points, and below that the cover gives way to the panel.
@@ -129,10 +135,19 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
     // Header: on the window buttons' line, when the app draws them.
     let lift = 20.0 - f32::from(super::titlebar::top_margin(20, 44.0));
     let header = Rect::from_min_size(area.min - vec2(0.0, if app.fullscreen { 0.0 } else { lift }), vec2(area.width(), 44.0));
-    if track.has_video() && !app.jam.active() {
+    // A song gets the switch too once its music video is found (or is playing). Songs, not
+    // music videos, with videos off: no switch on a song, and no music video looked up for
+    // it. A music video keeps its own: it's the only way from its song back to the video.
+    let songs_only = app.play_songs && !app.show_video;
+    if !app.jam.active() && (track.has_video() || (!songs_only && (app.playing_as().is_some() || app.song_video().is_some()))) {
         song_video_switch(app, ui, header);
     }
     let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(header).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    // macOS: past the traffic lights, which stay over now playing.
+    let gap = super::titlebar::left_gap(hui.ctx(), hui.max_rect(), 0.0);
+    if gap > 0.0 {
+        hui.add_space(gap);
+    }
     // The player's own close, top left; the window buttons keep the top right. The
     // chevron is drawn with strokes rather than read from the icon font: a glyph the
     // atlas hasn't got paints nothing at all, which used to leave this button
@@ -160,19 +175,23 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
         let cover_hidden = (narrow || cs.layout == Layout::LyricsOnly) && app.np_tab != NpTab::Art && !no_lyrics;
         if cover_hidden {
             let (r, _) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+            let heard = heard_track(app, &track, hold.is_some());
             options_menu(app, ui, r, &heard, app.np_tab == NpTab::Lyrics && !no_lyrics);
         }
     });
 
     let content = Rect::from_min_max(pos2(area.left(), header.bottom() + 12.0), area.max);
-    if video_mode {
-        video_stage(app, ui, content, &track);
+    if let Some(video) = video.as_ref() {
+        video_stage(app, ui, content, video);
         return;
     }
     if app.video.take().is_some() {
         app.video_frame = None;
         app.glow = None;
     }
+    // The sleeve's star and its menus go by what's heard: one clone a frame, shared
+    // with the cover column rather than taken again inside it.
+    let heard = heard_track(app, &track, hold.is_some());
     // What the margins came off: the whole player. The queue panel runs to its edge so
     // its scroll bar hugs the window's edge.
     let full = area.expand2(vec2(32.0, 20.0));
@@ -186,7 +205,7 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
         app.np_tab
     };
     // Linear 0..1 over the transition; each part eases its own slice of it.
-    let shown = ui.ctx().animate_bool_with_time(egui::Id::unique("np-panel"), app.np_tab != NpTab::Art, 0.6 * theme::SPEED);
+    let shown = ui.ctx().animate_bool_with_time(egui::Id::unique("np-panel"), app.np_tab != NpTab::Art, 0.6 * theme::speed());
     if shown > 0.0 && shown < 1.0 {
         // Every frame while sliding, not the now-playing view's usual 30 fps.
         ui.ctx().request_repaint();
@@ -212,13 +231,18 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
     // Artwork alone: centered.
     let col_art = Rect::from_center_size(content.center(), vec2(content.width().min(content.height() * 0.9), content.height()));
     let slide = 72.0;
+    // The volume dial's wake zone: the whole margin the sleeve leaves at the window's
+    // left edge, out to the art itself, not the old sliver beside it. Where nothing
+    // of the sleeve rests at the left (a right-side sleeve, narrow lyrics) the edge
+    // keeps its sliver; a centred artwork (artwork alone) answers to the margin.
+    let mut strip_right = content.left() + 8.0;
     let right = if lyrics_only {
         // No cover column next to the panel: the artwork fades in from the left as the panel leaves.
         let px = (art_side(cs, col_art) * ppp) as u32;
         if art_vis > 0.001 {
             let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content));
             cui.multiply_opacity(art_vis);
-            cover_column(app, &mut cui, col_art.translate(vec2(-slide * (1.0 - art_vis), 0.0)), &track, no_lyrics, now, px);
+            cover_column(app, &mut cui, col_art.translate(vec2(-slide * (1.0 - art_vis), 0.0)), &track, &heard, no_lyrics, now, px);
         } else {
             // Hidden behind the lyrics: have it loaded for when they're turned off.
             widgets::preload_cover(ui.ctx(), &track.thumbs, px);
@@ -234,9 +258,12 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
             Rect::from_min_size(content.min, vec2(col_w, content.height()))
         };
         let col = Rect::from_min_max(col_art.min.lerp(col_panel.min, glide), col_art.max.lerp(col_panel.max, glide));
+        if cs.side != Side::Right {
+            strip_right = ((col.center().x - art_side(cs, col) / 2.0 - 6.0).min(content.left() + 96.0)).max(full.left() + 44.0);
+        }
         // One image size for the whole glide, the bigger of its two ends.
         let px = (art_side(cs, col_art).max(art_side(cs, col_panel)) * ppp) as u32;
-        cover_column(app, ui, col, &track, no_lyrics, now, px);
+        cover_column(app, ui, col, &track, &heard, no_lyrics, now, px);
         if cs.side == Side::Right {
             Rect::from_min_max(content.min, pos2(col_panel.left() - 28.0, content.bottom()))
         } else {
@@ -249,7 +276,7 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
         // Switching between Lyrics and Up next: the old one fades out over the first 55%,
         // the new one fades in and rises into place from a third of the way.
         for (tab, key) in [(NpTab::Lyrics, "np-tab-lyrics"), (NpTab::UpNext, "np-tab-upnext"), (NpTab::Comments, "np-tab-comments")] {
-            let w = ui.ctx().animate_bool_with_time(egui::Id::unique(key), panel_tab == tab, 0.45 * theme::SPEED);
+            let w = ui.ctx().animate_bool_with_time(egui::Id::unique(key), panel_tab == tab, 0.45 * theme::speed());
             if w > 0.0 && w < 1.0 {
                 ui.ctx().request_repaint();
             }
@@ -279,6 +306,139 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
             }
         }
     }
+
+    // Corner toggles, both bottom-right: up next in the corner, lyrics beside it. Each
+    // lights up while its panel is the one showing; clicking the lit one returns to the
+    // artwork alone — the same trip the ⋯ menu's rows and the L/Q keys make.
+    let accent = app.accent_color();
+    let ink = |h: f32| theme::lerp_color(theme::text_dim(), theme::text(), h);
+    let corner = |ui: &mut Ui, center: Pos2, key: &str, name: &str| -> egui::Response {
+        let r = Rect::from_center_size(center, Vec2::splat(34.0));
+        let resp = ui.interact(r, egui::Id::unique(("np-corner", key)), Sense::click());
+        named(resp, name).on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand)
+    };
+    let r = corner(ui, pos2(area.right() - 64.0, area.bottom() - 20.0), "lyrics", "Lyrics");
+    let h = theme::anim_bool(ui.ctx(), r.id.with("h"), r.hovered(), 0.15);
+    let on = app.np_tab == NpTab::Lyrics && !no_lyrics;
+    ui.painter().circle_filled(r.rect.center(), 17.0, theme::glass(0.09 + 0.07 * h));
+    glyphs::draw(ui, r.rect.center(), 18.0, if on { glyphs::LYRICS } else { glyphs::LYRICS_OFF }, if on { accent } else { ink(h) });
+    if r.clicked() {
+        app.np_tab = if on { NpTab::Art } else { NpTab::Lyrics };
+    }
+    let r = corner(ui, pos2(area.right() - 20.0, area.bottom() - 20.0), "queue", "Up next");
+    let h = theme::anim_bool(ui.ctx(), r.id.with("h"), r.hovered(), 0.15);
+    let on = app.np_tab == NpTab::UpNext;
+    ui.painter().circle_filled(r.rect.center(), 17.0, theme::glass(0.09 + 0.07 * h));
+    glyphs::draw(ui, r.rect.center(), 18.0, glyphs::QUEUE, if on { accent } else { ink(h) });
+    if r.clicked() {
+        app.np_tab = if on { NpTab::Art } else { NpTab::UpNext };
+    }
+
+    edge_volume(app, ui, full, content, strip_right);
+}
+
+/// The volume along the view's left edge: the margin stays empty until the pointer
+/// comes into it, then osu!'s volume dial grows in — the level a neon arc round a
+/// dark disc, the number in its middle, the speaker a mute. Dragged across like a
+/// slider, the wheel a nudge. The view keeps its breathing room; the edge only has
+/// to be asked.
+fn edge_volume(app: &mut App, ui: &mut Ui, full: Rect, content: Rect, strip_right: f32) {
+    let open_id = egui::Id::unique("np-vol-open");
+    let was = ui.ctx().data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+    // The window's resize border owns the outermost sliver in a layer above this
+    // one, so the hover is read from the pointer's position rather than egui's
+    // `rect_contains_pointer`, which would report the border's verdict instead.
+    let hover = |r: Rect| ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| r.contains(p));
+    // The strip that wakes the dial runs from past the resize border to the sleeve.
+    // Once awake, the dial's own ground holds it — and any press, so a drag off the
+    // dial doesn't drop it mid-turn.
+    let strip = Rect::from_min_max(pos2(full.left() + 5.0, content.top()), pos2(strip_right, content.bottom()));
+    let r = 62.0;
+    let at = pos2(strip.center().x.max(full.left() + r + 8.0), content.center().y);
+    let dial = Rect::from_center_size(at, Vec2::splat(r * 2.0));
+    let open = hover(strip) || (was && (hover(dial.expand(10.0)) || ui.input(|i| i.pointer.any_down())));
+    ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
+    let reveal = theme::anim_bool(ui.ctx(), "np-vol-reveal", open, 0.15);
+    if reveal <= 0.001 {
+        return;
+    }
+    let vol = app.audio.volume();
+    let resp = ui
+        .interact(dial, egui::Id::unique("np-vol"), Sense::click_and_drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    let vh = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered() || resp.dragged(), 0.15);
+    resp.widget_info(|| egui::WidgetInfo::slider(true, vol as f64, "Volume"));
+    // Across the dial like a slider: its left edge silence, its right edge full.
+    if let Some(p) = resp.interact_pointer_pos()
+        && (resp.dragged() || resp.clicked())
+    {
+        app.audio.set_volume(((p.x - dial.left()) / dial.width()).clamp(0.0, 1.0));
+    }
+    if resp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll != 0.0 {
+            app.audio.set_volume((vol + scroll / 600.0).clamp(0.0, 1.0));
+        }
+    }
+    // The disc: darker than the old pill, so the gauge reads over whatever the
+    // background carries, with a rim to lift it off the art.
+    ui.painter().circle_filled(at, r, theme::shade(0.60 * reveal));
+    ui.painter().circle_stroke(at, r, egui::Stroke::new(1.0, theme::glass(0.10 * reveal)));
+    // The level as a neon arc: from the dial's foot, round the left and over the
+    // top, its length the volume — a notch stays at the foot, as in the reference,
+    // so full never closes. egui can't blur; layered strokes stand in for the glow,
+    // lit a touch stronger while it has the pointer.
+    let accent = if app.accent_controls { app.accent_color() } else { Color32::WHITE };
+    let sweep = std::f32::consts::PI * 5.0 / 3.0;
+    let len = sweep * vol.clamp(0.0, 1.0);
+    let steps = 48;
+    let arc_r = r - 9.0;
+    let pts: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let a = -std::f32::consts::FRAC_PI_2 - len * i as f32 / steps as f32;
+            at + vec2(a.cos(), -a.sin()) * arc_r
+        })
+        .collect();
+    for (w, a) in [(9.0, 0.10), (5.5, 0.22), (2.8 + 0.6 * vh, 1.0)] {
+        ui.painter().add(egui::Shape::Path(egui::epaint::PathShape::line(pts.clone(), egui::epaint::PathStroke::new(w, theme::with_alpha(accent, a * reveal)))));
+    }
+    // Round caps: egui paths end square, the reference's glow doesn't.
+    if len > 0.01 {
+        for p in [pts[0], *pts.last().unwrap()] {
+            ui.painter().circle_filled(p, 1.5, theme::with_alpha(accent, reveal));
+        }
+    }
+    // The level, said the way the reference says it: MAX at the top of the dial, the
+    // bare number under way.
+    let label = if vol >= 0.995 { "MAX".to_owned() } else { format!("{}", (vol * 100.0).round()) };
+    ui.painter().text(pos2(at.x, at.y - 15.0), egui::Align2::CENTER_CENTER, &label, theme::bold(26.0), theme::with_alpha(Color32::WHITE, reveal));
+    // The speaker in its puck at the dial's heart: a click mutes (the player bar's
+    // own trip), a hover rings it in the accent, as the reference's hovered icon.
+    let chip = Rect::from_center_size(pos2(at.x, at.y + 26.0), Vec2::splat(34.0));
+    let mresp = ui.interact(chip, egui::Id::unique("np-vol-mute"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mh = theme::anim_bool(ui.ctx(), mresp.id.with("h"), mresp.hovered(), 0.15);
+    ui.painter().circle_filled(chip.center(), 17.0, theme::glass(0.10 * reveal));
+    if mh > 0.0 {
+        ui.painter().circle_stroke(chip.center(), 19.0, egui::Stroke::new(2.0, theme::with_alpha(accent, mh * reveal)));
+    }
+    glyphs::draw(ui, chip.center(), 17.0, glyphs::VOLUME[glyphs::volume_step(vol)], theme::with_alpha(Color32::WHITE, reveal));
+    if mresp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll != 0.0 {
+            app.audio.set_volume((vol + scroll / 600.0).clamp(0.0, 1.0));
+        }
+    }
+    if mresp.clicked() {
+        super::shell::toggle_mute(app, ui.ctx());
+    }
+}
+
+/// What's heard while the sleeve shows `track`: a handoff's outgoing song stands in for
+/// the queue's, otherwise it's whatever actually plays. The clone is for the menus,
+/// which need `app` mutably beside it — so it's taken only where they're drawn, not for
+/// the whole frame (the video stage has no use for it).
+fn heard_track(app: &App, track: &crate::model::Track, hold: bool) -> crate::model::Track {
+    if hold { track.clone() } else { app.playing_track().cloned().unwrap_or_else(|| track.clone()) }
 }
 
 /// Song or Video, in the middle of the header, as YouTube Music's own apps have it.
@@ -286,10 +446,13 @@ fn song_video_switch(app: &mut App, ui: &mut Ui, header: Rect) {
     let rect = Rect::from_center_size(header.center(), vec2(170.0, header.height()));
     let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
     row.spacing_mut().item_spacing.x = 6.0;
-    let song = widgets::chip(&mut row, "Song", !app.show_video).clicked();
-    let video = widgets::chip(&mut row, "Video", app.show_video).clicked();
-    if (song && app.show_video) || (video && !app.show_video) {
-        app.actions.push(Action::ToggleVideo);
+    let picked = app.video_picked();
+    let song = widgets::chip(&mut row, "Song", !picked).clicked();
+    let video = widgets::chip(&mut row, "Video", picked).clicked();
+    if (song && picked) || (video && !picked) {
+        // On a song, its switch swaps in (or back from) its music video.
+        let on_song = app.current().is_some_and(|t| !t.has_video());
+        app.actions.push(if on_song { Action::SongVideo(!picked) } else { Action::ToggleVideo });
     }
 }
 
@@ -322,21 +485,24 @@ fn video_stage(app: &mut App, ui: &mut Ui, content: Rect, track: &crate::model::
         ui.painter().circle_filled(picture.center(), 38.0, theme::shade(0.58 * hover));
         widgets::icon_at(ui, picture.center(), if app.playing() || app.buffering { icon::PAUSE } else { icon::PLAY }, 37.0, theme::with_alpha(Color32::WHITE, hover));
     }
-    if cover.clicked() {
+    if cover.double_clicked() {
+        // The first of the two clicks paused it, or played it: back as it was.
+        app.actions.push(Action::TogglePlay);
+        app.set_video_fullscreen(ui.ctx(), true);
+    } else if cover.clicked() {
         app.actions.push(Action::TogglePlay);
     }
-    // Picture in picture, at the video's top right while it's pointed at.
+    // Picture in picture at the video's top right while it's pointed at, full screen at
+    // its bottom right.
     if ui.rect_contains_pointer(picture) || hover > 0.0 {
-        let c = pos2(picture.right() - 30.0, picture.top() + 30.0);
-        let b = Rect::from_center_size(c, Vec2::splat(40.0));
-        let resp = named(ui.interact(b, ui.scope_id().with("pip"), Sense::click()), "Picture in picture (Ctrl+M)")
-            .on_hover_text("Picture in picture (Ctrl+M)")
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        let shown = if resp.hovered() { 1.0 } else { hover.max(if ui.rect_contains_pointer(picture) { 1.0 } else { 0.0 }) };
-        ui.painter().circle_filled(c, 20.0, theme::shade(if resp.hovered() { 0.75 } else { 0.5 } * shown));
-        widgets::icon_at(ui, c, icon::PICTURE_IN_PICTURE, 18.0, theme::with_alpha(Color32::WHITE, shown));
-        if resp.clicked() {
+        let over = if ui.rect_contains_pointer(picture) { 1.0 } else { hover };
+        let pip = pos2(picture.right() - 30.0, picture.top() + 30.0);
+        if corner_button(ui, pip, icon::PICTURE_IN_PICTURE, "Picture in picture (Ctrl+M)", over).clicked() {
             app.actions.push(Action::Mini(true));
+        }
+        let full = pos2(picture.right() - 30.0, picture.bottom() - 30.0);
+        if corner_button(ui, full, icon::EXPAND, "Full screen (F)", over).clicked() {
+            app.set_video_fullscreen(ui.ctx(), true);
         }
     }
     let y = picture.bottom() + 12.0;
@@ -351,6 +517,225 @@ fn video_stage(app: &mut App, ui: &mut Ui, content: Rect, track: &crate::model::
             super::comments::panel(app, &mut q);
         } else {
             super::shell::queue_list(app, &mut q, "np", 14.0);
+        }
+    }
+}
+
+/// A round button over the video, as bright as `shown` (the pointer's on the video).
+fn corner_button(ui: &Ui, c: egui::Pos2, glyph: char, name: &str, shown: f32) -> egui::Response {
+    let b = Rect::from_center_size(c, Vec2::splat(40.0));
+    let resp = named(ui.interact(b, ui.scope_id().with(("video-corner", name)), Sense::click()), name).on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let shown = if resp.hovered() { 1.0 } else { shown };
+    ui.painter().circle_filled(c, 20.0, theme::shade(if resp.hovered() { 0.75 } else { 0.5 } * shown));
+    widgets::icon_at(ui, c, glyph, 18.0, theme::with_alpha(Color32::WHITE, shown));
+    resp
+}
+
+/// Since when the pointer has been still over the full-screen video.
+fn still_since_id() -> egui::Id {
+    egui::Id::unique("video-full-still-since")
+}
+
+/// Going into the video's full screen: its controls come up at first.
+pub(super) fn wake_video_controls(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<f64>(still_since_id()));
+}
+
+/// Full screen with just the video, on black, as on YouTube: the song's title and the
+/// controls come up while the pointer moves, and go, the pointer with them, once it has
+/// been still a moment away from them. A click plays or pauses, a double-click leaves.
+fn video_fullscreen(app: &mut App, ui: &mut Ui, rect: Rect, track: &crate::model::Track, now: f64) {
+    let ctx = ui.ctx().clone();
+    ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+    let frame = video_frame(app, &ctx, track);
+    let (w, h) = frame.as_ref().map_or((16.0, 9.0), |t| (t.size()[0] as f32, t.size()[1] as f32));
+    // Not while typing: into the command palette, say.
+    if !ctx.egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Z) && !i.modifiers.any()) {
+        set_video_fill(app, !app.video_fill);
+    }
+    // Filling: the picture inside its own bars, as large as covers the screen, its edges cut.
+    let content = if app.video_fill { app.video_content.unwrap_or(Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))) } else { Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)) };
+    let (cw, ch) = ((w * content.width()).max(1.0), (h * content.height()).max(1.0));
+    let scale = if app.video_fill { (rect.width() / cw).max(rect.height() / ch) } else { (rect.width() / cw).min(rect.height() / ch) };
+    let uv = Rect::from_center_size(content.center(), vec2((rect.width() / scale / w).min(content.width()), (rect.height() / scale / h).min(content.height())));
+    let picture = Rect::from_center_size(rect.center(), vec2(uv.width() * w * scale, uv.height() * h * scale));
+    match &frame {
+        Some(tex) => {
+            ui.painter().image(tex.id(), picture, uv, Color32::WHITE);
+        }
+        None => video_placeholder(ui, picture, track, 0.0),
+    }
+    let stage = named(ui.interact(rect, ui.scope_id().with("video-full-stage"), Sense::click()), if app.playing() { "Pause" } else { "Play" });
+    if stage.double_clicked() {
+        // The first of the two clicks paused it, or played it: back as it was.
+        app.actions.push(Action::TogglePlay);
+        app.set_fullscreen(&ctx, false);
+        return;
+    } else if stage.clicked() {
+        app.actions.push(Action::TogglePlay);
+    }
+    let bar_h = 104.0;
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+    let on_controls = pointer.is_some_and(|p| p.y >= rect.bottom() - bar_h || p.y <= rect.top() + 88.0);
+    let moved = ui.input(|i| i.pointer.delta() != Vec2::ZERO || !i.events.is_empty());
+    let since = ctx.data(|d| d.get_temp::<f64>(still_since_id()));
+    let since = match since {
+        Some(t) if !moved => t,
+        _ => {
+            ctx.data_mut(|d| d.insert_temp(still_since_id(), now));
+            now
+        }
+    };
+    let busy = on_controls || app.seek_drag.is_some() || egui::Popup::is_any_open(&ctx) || !app.playing();
+    let quiet = !busy && now - since > 2.5;
+    let shown = theme::anim_bool(&ctx, "video-full-controls", !quiet, 0.25);
+    if !quiet {
+        // To see the pointer has been still long enough.
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    } else if pointer.is_some() {
+        ctx.set_cursor_icon(egui::CursorIcon::None);
+    }
+    if shown <= 0.02 {
+        return;
+    }
+    let painter = ui.painter();
+    let top = Rect::from_min_size(rect.min, vec2(rect.width(), 120.0));
+    super::shell::vgradient(painter, top, theme::shade(0.6 * shown), Color32::TRANSPARENT);
+    let bottom = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 160.0), rect.max);
+    super::shell::vgradient(painter, bottom, Color32::TRANSPARENT, theme::shade(0.75 * shown));
+    let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    cui.multiply_opacity(shown);
+    let ui = &mut cui;
+    let text_w = rect.width() - 56.0;
+    widgets::title_at(ui, pos2(rect.left() + 28.0, rect.top() + 22.0), &track.title, track.explicit, theme::bold(20.0), Color32::WHITE, text_w);
+    let line = track.artist_line();
+    widgets::linked_text(ui, pos2(rect.left() + 28.0, rect.top() + 50.0), &line, &track.artists, theme::regular(15.0), theme::text_dim(), text_w, &mut app.actions);
+
+    // The seek bar, thickening with a knob while pointed at or dragged.
+    let status = app.audio.status.clone();
+    let total = status.duration().map(|d| d.as_secs_f32()).or(track.duration.map(|d| d as f32)).unwrap_or(0.0);
+    let pos = app.seek_drag.unwrap_or(status.position_smooth().as_secs_f32()).min(total.max(0.0));
+    let line_y = rect.bottom() - 66.0;
+    let hit = Rect::from_min_max(pos2(rect.left() + 20.0, line_y - 8.0), pos2(rect.right() - 20.0, line_y + 8.0));
+    let seek = ui.interact(hit, ui.scope_id().with("video-full-seek"), Sense::click_and_drag());
+    let seek = if total > 0.0 { seek.on_hover_cursor(egui::CursorIcon::PointingHand) } else { seek };
+    seek.widget_info(|| egui::WidgetInfo::slider(total > 0.0, pos as f64, "Seek"));
+    let lit = theme::anim_bool(&ctx, "video-full-seek-h", seek.hovered() || seek.dragged(), 0.15);
+    let thick = 3.0 + 2.0 * lit;
+    let track_r = Rect::from_center_size(pos2(hit.center().x, line_y), vec2(hit.width(), thick));
+    ui.painter().rect_filled(track_r, thick / 2.0, theme::with_alpha(Color32::WHITE, 0.25));
+    let frac = if total > 0.0 { pos / total } else { 0.0 };
+    let filled = Rect::from_min_size(track_r.min, vec2(track_r.width() * frac, thick));
+    let accent = app.accent_color();
+    ui.painter().rect_filled(filled, thick / 2.0, accent);
+    if lit > 0.0 && total > 0.0 {
+        ui.painter().circle_filled(pos2(filled.right(), line_y), 6.5 * lit, accent);
+        if let Some(p) = seek.hover_pos() {
+            let t = ((p.x - track_r.left()) / track_r.width()).clamp(0.0, 1.0) * total;
+            let g = widgets::galley(ui, &super::fmt_time(t as u32), theme::semibold(12.0), Color32::WHITE, 80.0);
+            let tip = Rect::from_center_size(pos2(p.x, line_y - 22.0), g.size() + vec2(12.0, 6.0));
+            ui.painter().rect_filled(tip, 6.0, theme::shade(0.75));
+            ui.painter().galley(tip.min + vec2(6.0, 3.0), g, Color32::WHITE);
+        }
+    }
+    if total > 0.0
+        && let Some(p) = seek.interact_pointer_pos()
+    {
+        let t = ((p.x - track_r.left()) / track_r.width()).clamp(0.0, 1.0) * total;
+        if seek.dragged() {
+            app.seek_drag = Some(t);
+        }
+        if seek.drag_stopped() || seek.clicked() {
+            app.seek_drag = None;
+            app.actions.push(Action::Seek(t));
+        }
+    }
+
+    // The buttons under it: playing and the volume on the left, the rest on the right.
+    let row = Rect::from_min_max(pos2(rect.left() + 12.0, line_y + 10.0), pos2(rect.right() - 12.0, rect.bottom() - 6.0));
+    let mut left = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    left.spacing_mut().item_spacing.x = 2.0;
+    if widgets::icon_button(&mut left, icon::SKIP_BACK, 20.0, "Previous", false).clicked() {
+        app.prev();
+    }
+    let playing = app.playing() || app.buffering;
+    if widgets::icon_button(&mut left, if playing { icon::PAUSE } else { icon::PLAY }, 24.0, if playing { "Pause" } else { "Play" }, false).clicked() {
+        app.actions.push(Action::TogglePlay);
+    }
+    if widgets::icon_button(&mut left, icon::SKIP_FORWARD, 20.0, "Next", false).clicked() {
+        app.next();
+    }
+    let vol = app.audio.volume();
+    let vglyph = if vol == 0.0 { icon::VOLUME_X } else if vol < 0.5 { icon::VOLUME_1 } else { icon::VOLUME_2 };
+    if widgets::icon_button(&mut left, vglyph, 19.0, if vol > 0.0 { "Mute" } else { "Unmute" }, false).clicked() {
+        let stash = super::shell::unmute_id();
+        if vol > 0.0 {
+            left.data_mut(|d| d.insert_temp(stash, vol));
+            app.audio.set_volume(0.0);
+        } else {
+            let v = left.data(|d| d.get_temp::<f32>(stash)).unwrap_or(0.6);
+            app.audio.set_volume(v);
+        }
+    }
+    let (slider, _) = left.allocate_exact_size(vec2(90.0, 20.0), Sense::hover());
+    super::shell::volume_slider(app, &mut left, slider, "video-full-vol");
+    left.add_space(14.0);
+    if total > 0.0 {
+        let time = format!("{} / {}", super::fmt_time(pos as u32), super::fmt_time(total as u32));
+        left.label(egui::RichText::new(time).font(theme::regular(13.5)).color(Color32::WHITE));
+    }
+    let mut right = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    right.spacing_mut().item_spacing.x = 2.0;
+    if widgets::icon_button(&mut right, icon::SHRINK, 20.0, "Exit full screen (Esc)", false).clicked() {
+        app.set_fullscreen(&ctx, false);
+    }
+    if widgets::icon_button(&mut right, icon::PICTURE_IN_PICTURE, 19.0, "Picture in picture (Ctrl+M)", false).clicked() {
+        app.actions.push(Action::Mini(true));
+    }
+    let fill_tip = if app.video_fill { "Fit to screen (Z)" } else { "Fill the screen (Z)" };
+    if widgets::icon_button(&mut right, icon::MAXIMIZE_2, 18.0, fill_tip, app.video_fill).clicked() {
+        set_video_fill(app, !app.video_fill);
+    }
+    right.add_space(6.0);
+    // What it plays at: a video may not come as sharp as asked.
+    let playing_at = app.video.as_ref().and_then(|(_, p)| p.as_ref()).map(crate::video::Player::height).filter(|&h| h > 0);
+    quality_button(app, &mut right, playing_at);
+}
+
+/// Full screen fills the screen with the video, or fits it whole. Looks for its bars afresh.
+fn set_video_fill(app: &mut App, on: bool) {
+    app.video_fill = on;
+    app.video_content = None;
+    app.video_content_at = 0.0;
+}
+
+/// The video's quality, a menu of the others above it.
+fn quality_button(app: &mut App, ui: &mut Ui, playing_at: Option<u32>) {
+    let label = format!("{}p", playing_at.unwrap_or(app.video_quality));
+    let g = widgets::galley(ui, &label, theme::semibold(13.0), Color32::WHITE, 80.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 44.0, 32.0), Sense::click());
+    let resp = named(resp, "Video quality").on_hover_text("Video quality").on_hover_cursor(egui::CursorIcon::PointingHand);
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
+    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered() || open, 0.12);
+    ui.painter().rect_filled(rect, 16.0, theme::glass(0.10 + 0.08 * h));
+    widgets::icon_at(ui, pos2(rect.left() + 17.0, rect.center().y), icon::SETTINGS, 15.0, Color32::WHITE);
+    ui.painter().galley(pos2(rect.left() + 30.0, rect.center().y - g.size().y / 2.0), g, Color32::WHITE);
+    egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        ui.set_width(170.0);
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        ui.add_space(4.0);
+        quality_rows(app, ui);
+        ui.add_space(4.0);
+    });
+}
+
+/// The video qualities to pick from, in a menu. Settings › Music videos has the same.
+fn quality_rows(app: &mut App, ui: &mut Ui) {
+    menu_caption(ui, "VIDEO QUALITY");
+    for q in super::VIDEO_QUALITIES {
+        if super::pages::option_row(ui, &format!("{q}p"), q == app.video_quality).clicked() {
+            set_video_quality(app, q);
+            ui.close();
         }
     }
 }
@@ -396,10 +781,12 @@ pub(super) fn video_frame(app: &mut App, ctx: &egui::Context, track: &crate::mod
     if app.video.as_ref().is_none_or(|(id, _)| *id != track.id) {
         app.video = Some((track.id.clone(), None));
         app.video_frame = None;
+        app.video_content = None;
         app.glow = None;
         app.backend.request(crate::backend::Req::VideoStream { video_id: track.id.clone(), max_height: app.video_quality });
     }
-    let player = app.video.as_ref()?.1.as_ref()?;
+    // On its way at another quality: the last picture stays up meanwhile.
+    let Some(player) = app.video.as_ref()?.1.as_ref() else { return app.video_frame.clone() };
     if player.failed() {
         return None;
     }
@@ -416,6 +803,15 @@ pub(super) fn video_frame(app: &mut App, ctx: &egui::Context, track: &crate::mod
                 }
             }
         }
+        // Where its own black bars are, for filling the screen: a few times a second, the
+        // picture widening as brighter frames show more of it.
+        let now = ctx.input(|i| i.time);
+        if app.video_fill && app.video_full && now - app.video_content_at > 0.5 {
+            app.video_content_at = now;
+            if let Some(seen) = crate::video::content_uv(&frame.image) {
+                app.video_content = Some(app.video_content.map_or(seen, |c| c.union(seen)));
+            }
+        }
         match &mut app.video_frame {
             Some(tex) => tex.set(frame.image, egui::TextureOptions::LINEAR),
             None => app.video_frame = Some(ctx.load_texture("music-video", frame.image, egui::TextureOptions::LINEAR)),
@@ -430,6 +826,19 @@ pub(super) fn video_frame(app: &mut App, ctx: &egui::Context, track: &crate::mod
     app.video_frame.clone()
 }
 
+/// Play videos at most `height` tall, the one on show too: it carries on from where the
+/// song is, at the new quality, once that has loaded.
+pub(super) fn set_video_quality(app: &mut App, height: u32) {
+    if app.video_quality == height {
+        return;
+    }
+    app.video_quality = height;
+    if let Some((id, player)) = &mut app.video {
+        *player = None;
+        app.backend.request(crate::backend::Req::VideoStream { video_id: id.clone(), max_height: height });
+    }
+}
+
 /// Size of the artwork laid out in `col`: what is left once the sleeve's information,
 /// its bar and the transport underneath it have taken their room.
 fn art_side(cs: &crate::preset::CoverStyle, col: Rect) -> f32 {
@@ -437,13 +846,13 @@ fn art_side(cs: &crate::preset::CoverStyle, col: Rect) -> f32 {
 }
 
 /// The sleeve: art, title and artists, the seek line with its two times, then the
-/// transport — the order the reference keeps them in. `px`: the size to fetch the image
-/// at (fixed while the column glides).
-fn cover_column(app: &mut App, ui: &mut Ui, col: Rect, track: &crate::model::Track, no_lyrics: bool, now: f64, px: u32) {
+/// transport — the order the reference keeps them in. `heard`: what's heard (the song
+/// version of the video on show, the outgoing song of a handoff), for its star and
+/// menus. `px`: the size to fetch the image at (fixed while the column glides).
+fn cover_column(app: &mut App, ui: &mut Ui, col: Rect, track: &crate::model::Track, heard: &crate::model::Track, no_lyrics: bool, now: f64, px: u32) {
     use crate::preset::Shape;
-    // A handoff's outgoing song is still what's heard: its star, menu and seek are its own.
+    // A handoff's outgoing song is still what's heard: its seek is its own.
     let hold = app.mix_hold().map(|h| (h.total, h.mix, app.mix_hold_pos(h)));
-    let heard = if hold.is_some() { track.clone() } else { app.playing_track().cloned().unwrap_or_else(|| track.clone()) };
     let look = app.look();
     let cs = &look.cover;
     let side = art_side(cs, col);
@@ -451,16 +860,18 @@ fn cover_column(app: &mut App, ui: &mut Ui, col: Rect, track: &crate::model::Tra
     let round = cs.shape != Shape::Rounded;
     let radius = if round { side / 2.0 } else { cs.radius.clamp(0.0, side / 2.0) };
     let cr = egui::CornerRadius::same(radius.min(255.0) as u8);
-    if cs.glow > 0.0 {
+    // Settings › Appearance: the sleeve's shadow and glow can be left out entirely.
+    if app.cover_fx && cs.glow > 0.0 {
         let s = egui::epaint::Shadow { offset: [0, 16], blur: 90, spread: 6, color: theme::with_alpha(app.accent_color(), cs.glow.min(1.0) * 0.7) };
         ui.painter().add(s.as_shape(art, cr));
     }
-    if cs.shadow > 0.0 {
+    if app.cover_fx && cs.shadow > 0.0 {
         widgets::soft_shadow(ui, art, radius.min(255.0), 60.0, cs.shadow.min(1.0));
     }
     let tint = Color32::from_gray((cs.brightness.clamp(0.1, 1.0) * 255.0) as u8);
     if round {
-        if cs.shape == Shape::Record && app.playing() {
+        // Reduce motion (Settings › Appearance) stops the spin, not the shape.
+        if cs.shape == Shape::Record && app.playing() && !app.reduce_motion {
             let dt = ui.input(|i| i.stable_dt).min(0.1) as f64;
             app.record_angle = (app.record_angle + dt * std::f64::consts::TAU / cs.spin_secs.max(4.0) as f64) % std::f64::consts::TAU;
         }
@@ -486,6 +897,8 @@ fn cover_column(app: &mut App, ui: &mut Ui, col: Rect, track: &crate::model::Tra
             ui.painter().rect_filled(art, cr, theme::shade(1.0 - cs.brightness));
         }
     }
+    // Stats for nerds, on the foot of the sleeve: what the decoder is being fed.
+    nerd_stats(app, ui, art, round);
     // Title and artists: 17 semibold over 15 secondary, left-aligned to the art.
     let w = side;
     let x0 = art.left();
@@ -550,7 +963,7 @@ fn cover_column(app: &mut App, ui: &mut Ui, col: Rect, track: &crate::model::Tra
     }
     // The song's options, beside the star.
     let options = Rect::from_center_size(pos2(art.right() - 15.0, info_y + 14.0), Vec2::splat(34.0));
-    options_menu(app, ui, options, &heard, app.np_tab == NpTab::Lyrics && !no_lyrics);
+    options_menu(app, ui, options, heard, app.np_tab == NpTab::Lyrics && !no_lyrics);
 
     // Seek: a 4 px line that grows under the pointer, its times below.
     let status = app.audio.status.clone();
@@ -804,7 +1217,25 @@ fn decorations<'a>(
 }
 
 fn synced(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, lyrics: &Lyrics, now: f64, narrow: bool) {
-    let style = &app.look().lyrics;
+    // Settings › Appearance: the theme's lyrics with the blur and glow off, built once
+    // per theme and kept on the App — the karaoke view caches its layout by the style's
+    // address, so a fresh copy each frame would relayout every frame.
+    if !app.lyric_fx && app.plain_style.as_ref().is_none_or(|(theme, _)| *theme != app.look().id) {
+        let look = app.look();
+        let mut plain = look.lyrics.clone();
+        plain.blur = 0.0;
+        plain.glow = 0.0;
+        if let Some(css) = &mut plain.css {
+            css.past = css.past.map(|[opacity, _]| [opacity, 0.0]);
+            css.upcoming = css.upcoming.map(|[opacity, _]| [opacity, 0.0]);
+        }
+        app.plain_style = Some((look.id.clone(), plain));
+    }
+    let style = if app.lyric_fx {
+        &app.look().lyrics
+    } else {
+        &app.plain_style.as_ref().expect("just built").1
+    };
     let accent = app.accent_color();
     let centered = narrow || style.align == crate::preset::Align::Center;
     let playing = if app.mix_hold().is_some() { app.audio.status.outgoing_playing() } else { app.playing() };
@@ -816,25 +1247,58 @@ fn synced(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, lyrics: &Lyrics, now
     };
     let pos = app.lyric_clock.tick(pos, playing, now, app.audio.status.speed() as f64);
     let t = pos - app.lyric_prefs.offset(id, lyrics.provider, lyrics.sync == Sync::Word);
-    let (roman, trans) = decorations(app.show_roman, app.show_trans, &app.lyric_prefs.target, app.lyrics_extras.as_ref(), id, lyrics);
-    let key = {
+    let (roman, trans) = decorations(
+        app.show_roman,
+        app.show_trans,
+        &app.lyric_prefs.target,
+        app.lyrics_extras.as_deref(),
+        id,
+        lyrics,
+    );
+    // The decoration strings only change when the song, its source, the theme or the
+    // romanization/translation settings do; hashing all of them every frame of the
+    // sweep was O(the lyrics' whole text). The identity is pointers and short strings.
+    let identity = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::ptr::from_ref(lyrics).hash(&mut h);
         id.hash(&mut h);
         lyrics.provider.key().hash(&mut h);
         app.theme_id.hash(&mut h);
-        for r in &roman {
-            match r {
-                Some(karaoke::Roman::Timed(_, s)) | Some(karaoke::Roman::Text(s)) => s.hash(&mut h),
-                None => 0u8.hash(&mut h),
-            }
-        }
-        trans.hash(&mut h);
+        app.show_roman.hash(&mut h);
+        app.show_trans.hash(&mut h);
+        app.lyric_prefs.target.hash(&mut h);
+        app.lyrics_extras
+            .as_ref()
+            .map(std::sync::Arc::as_ptr)
+            .hash(&mut h);
         h.finish()
+    };
+    let key = match app.decorations_key {
+        Some((seen, key)) if seen == identity => key,
+        _ => {
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                id.hash(&mut h);
+                lyrics.provider.key().hash(&mut h);
+                app.theme_id.hash(&mut h);
+                for r in &roman {
+                    match r {
+                        Some(karaoke::Roman::Timed(_, s)) | Some(karaoke::Roman::Text(s)) => s.hash(&mut h),
+                        None => 0u8.hash(&mut h),
+                    }
+                }
+                trans.hash(&mut h);
+                h.finish()
+            };
+            app.decorations_key = Some((identity, key));
+            key
+        }
     };
     let scale = app.lyric_prefs.text_scale;
     let glow_boost = if app.lyric_prefs.glow_boost { app.lyric_prefs.glow_strength } else { 0.0 };
-    let frame = karaoke::Frame { lyrics, key, roman, trans, t, playing, now, rect, style, accent, centered, scale, glow_boost };
+    let frame = karaoke::Frame { lyrics, key, roman, trans, t, playing, now, rect, style, accent, centered, scale, glow_boost, light: app.lyric_light };
     // The view lives in `app`; the frame borrows `app` for decorations, so swap it out.
     let mut view = std::mem::take(&mut app.lyric_view);
     let out = if karaoke::dev_off("view") { karaoke::Out { seek: None, animating: true, user_scrolling: false } } else { view.show(ui, frame) };
@@ -843,8 +1307,13 @@ fn synced(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, lyrics: &Lyrics, now
         app.actions.push(Action::Seek(s as f32));
     }
     if out.animating {
-        // Smooth, without following a fast monitor: frame rate is the main CPU and GPU cost.
-        super::pace::repaint_after(ui.ctx(), std::time::Duration::from_millis(16));
+        if app.lyrics_full_rate {
+            // As fast as the screen shows them: vsync, or `pace::frame`, sets the rate.
+            ui.ctx().request_repaint();
+        } else {
+            // Smooth, without following a fast monitor: frame rate is the main CPU and GPU cost.
+            super::pace::repaint_after(ui.ctx(), std::time::Duration::from_millis(16));
+        }
     }
     // The extension's `.autoscroll-resume-button` (YouTube Music's rem is 10 px): a frosted
     // pill under the top edge in the lyrics font at 600, 1.75rem; padding .5rem 1rem;
@@ -944,24 +1413,39 @@ fn options_menu(app: &mut App, ui: &mut Ui, rect: Rect, track: &crate::model::Tr
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         ui.add_space(4.0);
         // Lyrics first: the source, translation and timing are what the menu is for
-        // while the lyrics are up.
+        // while the lyrics are up. Collapsed under a header by default, since these
+        // settings only matter while the lyrics are up and the menu is tight.
         if lyrics {
-            lyric_options(app, ui);
+            let key = ui.id().with("np-lyrics-expanded");
+            let mut expanded: bool = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+            if lyrics_options_header(ui, expanded) {
+                expanded = !expanded;
+                ui.data_mut(|d| d.insert_temp(key, expanded));
+            }
+            if expanded {
+                lyric_options(app, ui);
+            }
             menu_divider(ui);
         }
-        // No Like/Dislike here: the star under the cover does the liking, and this menu
+        if app.shown_video().is_some() {
+            quality_rows(app, ui);
+            menu_divider(ui);
+        }
+        // No Like here: the star under the cover does the liking, and this menu
         // keeps to what a playing song's ⋯ is for.
         widgets::song_actions(ui, track, false, None, &mut app.actions, false);
         menu_divider(ui);
-        if widgets::menu_action(ui, Some(icon::LIST_PLUS), "Play next") {
-            app.actions.push(Action::PlayNext(track.clone()));
-        }
-        if widgets::menu_action(ui, Some(icon::LIST_MUSIC), "Add to queue") {
-            app.actions.push(Action::Enqueue(track.clone()));
+        // No "Play next" / "Add to queue" here: the song is already playing, and the
+        // loop button on the player bar is the right tool for what comes next. Each
+        // panel hides the way comments does — back to the artwork, the same trip the
+        // L/Q keys make — and its glyph is the one the player bar's button carries.
+        let lyrics = app.np_tab == NpTab::Lyrics;
+        if widgets::menu_row(ui, if lyrics { "Hide lyrics" } else { "View lyrics" }, |ui, at, color| glyphs::draw(ui, at, 18.0, glyphs::LYRICS, color)) {
+            app.np_tab = if lyrics { NpTab::Art } else { NpTab::Lyrics };
         }
         let queue = app.np_tab == NpTab::UpNext;
-        if widgets::menu_action(ui, Some(icon::LIST_MUSIC), if queue { "View lyrics" } else { "View queue" }) {
-            app.np_tab = if queue { NpTab::Lyrics } else { NpTab::UpNext };
+        if widgets::menu_row(ui, if queue { "Hide queue" } else { "View queue" }, |ui, at, color| glyphs::draw(ui, at, 18.0, glyphs::QUEUE, color)) {
+            app.np_tab = if queue { NpTab::Art } else { NpTab::UpNext };
         }
         if app.show_comments {
             let tab = app.np_tab == NpTab::Comments;
@@ -974,18 +1458,51 @@ fn options_menu(app: &mut App, ui: &mut Ui, rect: Rect, track: &crate::model::Tr
         }
         // Quality toggle at the bottom: revert when hi-res is playing, upgrade when not.
         let hires_playing = app.audio_info.as_ref().is_some_and(|(_, i)| i.lossless() || i.atmos);
-        if hires_playing || !app.hires_sources.is_empty() {
+        // The upgrade button shows whenever an upgrade could come from somewhere —
+        // any of the configured music sources, not just the custom addon URLs, since
+        // Monochrome servers, Monochrome's built-in streamer, and JioSaavn all swap
+        // a YouTube stream in place the same way (see `try_upgrade_hires`).
+        let addons_ready = app.addons_on && app.hires_sources.iter().enumerate().any(|(i, s)| {
+            !s.trim().is_empty() && app.hires_enabled.get(i).copied().unwrap_or(true)
+        });
+        let any_upgrade_source = addons_ready || app.mono_servers_on || app.monochrome || app.jiosaavn;
+        if hires_playing || any_upgrade_source {
             menu_divider(ui);
             if hires_playing {
                 if widgets::menu_action(ui, Some(icon::MUSIC), "Revert quality") {
                     app.actions.push(Action::RevertQuality);
                 }
-            } else if widgets::menu_action(ui, Some(icon::MUSIC), "Upgrade quality") {
+            }
+            // Upgrade stays visible even on a hi-res track: the listener may want to try
+            // another source. Before, `Upgrade quality` was the else-branch of `hires_playing`,
+            // so any song that already played in hi-res looked as if the option had gone
+            // missing from the menu.
+            if any_upgrade_source && widgets::menu_action(ui, Some(icon::MUSIC), "Upgrade quality") {
                 app.actions.push(Action::UpgradeQuality);
             }
         }
         ui.add_space(4.0);
     });
+}
+
+/// The header row that opens [`lyric_options`]. Collapsed by default to save the
+/// menu's vertical space — the source picker, translation toggle, romanization toggle
+/// and timing nudge only matter while the lyrics are up, so they don't need to be on
+/// the menu's first screen. Doesn't close the popup on click: expanding is a state
+/// change, not an action, and the listener should see the rows appear in place.
+fn lyrics_options_header(ui: &mut Ui, expanded: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+    let resp = named(resp, "Lyrics options").on_hover_cursor(egui::CursorIcon::PointingHand);
+    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.12);
+    if h > 0.0 {
+        ui.painter().rect_filled(rect, 7.0, theme::glass(0.12 * h));
+    }
+    let color = if resp.hovered() { theme::text() } else { theme::text_dim() };
+    widgets::icon_at(ui, pos2(rect.left() + 19.0, rect.center().y), icon::LIST_MUSIC, 16.0, color);
+    ui.painter().text(pos2(rect.left() + 40.0, rect.center().y), egui::Align2::LEFT_CENTER, "Lyrics options", theme::regular(14.0), theme::text());
+    let chevron = if expanded { icon::CHEVRON_DOWN } else { icon::CHEVRON_RIGHT };
+    widgets::icon_at(ui, pos2(rect.right() - 19.0, rect.center().y), chevron, 16.0, color);
+    resp.clicked()
 }
 
 fn lyric_options(app: &mut App, ui: &mut Ui) {
@@ -1077,7 +1594,7 @@ fn quality_mark_aspect(atmos: bool) -> f32 {
 /// The icon as white pixels with its own alpha, so it takes the badge's tint.
 fn quality_icon_texture(ui: &Ui, atmos: bool, mark: bool) -> egui::TextureHandle {
     let ctx = ui.ctx();
-    let id = egui::Id::unique(("quality-icon", atmos, mark));
+    let id = egui::Id::new(("quality-icon", atmos, mark));
     if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
         return tex;
     }
@@ -1105,7 +1622,14 @@ fn paint_quality_icon(ui: &Ui, center: egui::Pos2, height: f32, atmos: bool, tin
 
 /// How wide the quality mark is, so a line can leave room for it.
 pub(super) fn audio_badge_width(ui: &Ui, app: &App, small: bool) -> f32 {
-    let Some((_, info)) = app.audio_info.as_ref() else { return 0.0 };
+    let Some((_, info)) = app.audio_info.as_ref() else {
+        if app.upgrading_quality {
+            let label = "Upgrading quality";
+            let text = widgets::galley(ui, label, badge_font(small), Color32::WHITE, 200.0).size().x;
+            return text + glyph_side(small) + 5.0;
+        }
+        return 0.0;
+    };
     let gh = glyph_side(small);
     if info.atmos && !app.mixing() {
         return gh * quality_icon_aspect(true);
@@ -1118,6 +1642,29 @@ pub(super) fn audio_badge_width(ui: &Ui, app: &App, small: bool) -> f32 {
 /// The quality mark — a glyph and the stream's name, tinted with the theme — drawn at
 /// `at`; a click opens its details. Returns how much room it took.
 pub(super) fn audio_badge(app: &App, ui: &mut Ui, at: egui::Pos2, small: bool) -> f32 {
+    if app.audio_info.is_none() && app.upgrading_quality {
+        // A background upgrade at work: the wave pulses while the addons are asked.
+        let font = badge_font(small);
+        let gh = glyph_side(small);
+        let now = ui.input(|i| i.time);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        let pulse = ((now * 3.5).sin() * 0.5 + 0.5) as f32;
+        let alpha = 0.35 + 0.65 * pulse;
+        let accent = app.accent_color();
+        let ink = theme::with_alpha(theme::lerp_color(accent, Color32::WHITE, 0.20), alpha);
+        let mark = theme::with_alpha(accent, alpha);
+        let g = widgets::galley(ui, "Upgrading quality", font, ink, 200.0);
+        let w = audio_badge_width(ui, app, small);
+        let h = g.size().y.max(gh);
+        let rect = Rect::from_min_size(at, vec2(w, h));
+        let resp = ui.interact(rect, ui.scope_id().with("audio-badge-upgrading"), Sense::hover());
+        named(resp, "Audio quality").on_hover_text("Checking hi-res addons and upgrading audio quality...");
+        let mut x = at.x;
+        super::glyphs::draw(ui, pos2(x + gh / 2.0, at.y + h / 2.0), gh, super::glyphs::WAVE, mark);
+        x += gh + 5.0;
+        ui.painter().galley(pos2(x, at.y + (h - g.size().y) / 2.0), g, ink);
+        return w;
+    }
     let Some((_, info)) = app.audio_info.as_ref() else { return 0.0 };
     let font = badge_font(small);
     // A mix in progress wears its own name over the quality mark; the details keep the truth.
@@ -1157,11 +1704,25 @@ pub(super) fn audio_badge(app: &App, ui: &mut Ui, at: egui::Pos2, small: bool) -
 
 /// Just the quality glyph, centred on `center`, for the mini player's artist line.
 pub(super) fn audio_badge_icon_width(app: &App, small: bool) -> f32 {
+    if app.audio_info.is_none() && app.upgrading_quality {
+        return glyph_side(small);
+    }
     let Some((_, info)) = app.audio_info.as_ref().filter(|(_, i)| has_quality_glyph(i)) else { return 0.0 };
     glyph_side(small) * quality_mark_aspect(info.atmos)
 }
 
 pub(super) fn audio_badge_icon(app: &App, ui: &mut Ui, center: egui::Pos2, small: bool) {
+    if app.audio_info.is_none() && app.upgrading_quality {
+        let gh = glyph_side(small);
+        let now = ui.input(|i| i.time);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        let pulse = ((now * 3.5).sin() * 0.5 + 0.5) as f32;
+        let alpha = 0.35 + 0.65 * pulse;
+        let accent = app.accent_color();
+        let mark = theme::with_alpha(accent, alpha);
+        super::glyphs::draw(ui, center, gh, super::glyphs::WAVE, mark);
+        return;
+    }
     let Some((_, info)) = app.audio_info.as_ref().filter(|(_, i)| has_quality_glyph(i)) else { return };
     let gh = glyph_side(small);
     let rect = Rect::from_center_size(center, vec2(gh * quality_mark_aspect(info.atmos), gh));
@@ -1261,6 +1822,48 @@ fn rate_text(hz: u32) -> String {
 
 fn size_text(bytes: u64) -> String {
     if bytes >= 1024 * 1024 { format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)) } else { format!("{:.0} KB", bytes as f64 / 1024.0) }
+}
+
+fn channels_text(n: u16) -> String {
+    match n {
+        1 => "Mono".to_owned(),
+        2 => "Stereo".to_owned(),
+        _ => format!("{n} channels"),
+    }
+}
+
+/// Stats for nerds, on the foot of the sleeve: what the decoder is being fed, from
+/// whichever source. Nothing while the setting is off.
+fn nerd_stats(app: &App, ui: &Ui, art: Rect, round: bool) {
+    let Some((_, stats)) = app.stream_stats.as_ref().filter(|_| app.show_nerd_stats) else { return };
+    let ink = theme::with_alpha(Color32::WHITE, 0.65);
+    let g = widgets::galley(ui, &stats_line(stats), theme::semibold(11.0), ink, art.width() - 20.0);
+    // A disc narrows toward its foot: the line rises until it fits across.
+    let foot = if round {
+        let r = art.width() / 2.0;
+        let half = (g.size().x / 2.0 + 10.0).min(r);
+        art.center().y + (r * r - half * half).sqrt() - 8.0
+    } else {
+        art.bottom() - 8.0
+    };
+    let at = pos2(art.center().x - g.size().x / 2.0, foot - g.size().y);
+    // Plain white washes out over a pale cover; the shadow under it keeps it legible.
+    ui.painter().galley_with_override_text_color(at + vec2(0.0, 1.0), g.clone(), Color32::from_black_alpha(140));
+    ui.painter().galley(at, g, ink);
+}
+
+/// The stats as one line: `Opus · 48 kHz · 133 kbps · Stereo`.
+fn stats_line(s: &crate::stream::Stats) -> String {
+    let mut parts = vec![s.codec.clone()];
+    if let Some(bits) = s.bit_depth {
+        parts.push(format!("{bits}-bit"));
+    }
+    parts.push(rate_text(s.sample_rate));
+    if let Some(kbps) = s.bitrate_kbps {
+        parts.push(format!("{} kbps", thousands(kbps)));
+    }
+    parts.push(channels_text(s.channels));
+    parts.join(" · ")
 }
 
 /// A lyrics source: its sync type's dot, name and sync type, with a check on the one shown.

@@ -207,6 +207,33 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     if t >= 1.0 { b } else { a + (b - a) * t }
 }
 
+/// The room the level must dip to on the way from one curve to another: partway
+/// between them the curve can peak higher than at either end, so the level makes room
+/// for the loudest of a few points along the way (finer found under 0.05 dB more,
+/// inside the margin `headroom_db` leaves), and for how far filters on the move throw a
+/// low tone past it: ~0.55 dB lifting a big cut off sub-bass. Under 20 Hz, where music
+/// hardly goes, a full-scale tone can still go ~0.5 dB over for a moment; making room
+/// for that too would dip the level on every drag.
+fn room(
+    from: Gains,
+    from_pre: f32,
+    target: Gains,
+    target_pre: f32,
+    no_clip: bool,
+    rate: f64,
+) -> f32 {
+    let far = (0..BANDS.len()).map(|i| (target[i] - from[i]).abs()).fold(0.0, f32::max);
+    let mut floor = from_pre.min(target_pre);
+    if no_clip {
+        let partway = (1..8).map(|k| headroom_db(&std::array::from_fn(|i| lerp(from[i], target[i], k as f32 / 8.0)), rate));
+        let dip = partway.fold(target_pre, f32::min) - (far * 0.06).min(1.0);
+        // Taken from what's needed, not from where the level is, so a drag restarting
+        // this every few blocks doesn't sink it further each time.
+        floor = floor.min(dip);
+    }
+    floor
+}
+
 /// What the UI wants, read by the device's thread.
 #[derive(Default)]
 pub struct EqParams {
@@ -215,6 +242,21 @@ pub struct EqParams {
     gains: [AtomicU32; 10],
     /// Turn everything down by the curve's highest boost.
     no_clip: AtomicBool,
+    /// The device's sample rate, written when it opens; the curve is fitted at it.
+    rate: AtomicU32,
+    /// Where the device's filters and level are, published as they glide: the room for
+    /// the next change is measured from here.
+    at: [AtomicU32; 10],
+    at_pre: AtomicU32,
+    /// The fitted curve for the sliders and the level it needs, computed by `set` on
+    /// the calling thread. Fitting (a least-squares solve plus a sweep of the curve's
+    /// peak) per block while a slider is dragged is work the device's callback must
+    /// not do between samples; it only glides between the schedules posted here.
+    target: [AtomicU32; 10],
+    target_pre: AtomicU32,
+    floor: AtomicU32,
+    /// The rate `target` was fitted at, so a device at another rate knows to fit again.
+    fit_rate: AtomicU32,
     /// Bumped after the rest is written, for the device's thread to notice.
     version: AtomicU32,
 }
@@ -222,10 +264,37 @@ pub struct EqParams {
 impl EqParams {
     pub fn set(&self, on: bool, gains: &Gains, no_clip: bool) {
         self.on.store(on, Ordering::Relaxed);
-        for (a, g) in self.gains.iter().zip(gains) {
-            a.store(g.clamp(-MAX_DB, MAX_DB).to_bits(), Ordering::Relaxed);
+        let mut sliders = *gains;
+        for g in &mut sliders {
+            *g = g.clamp(-MAX_DB, MAX_DB);
+        }
+        for (a, g) in self.gains.iter().zip(&sliders) {
+            a.store(g.to_bits(), Ordering::Relaxed);
         }
         self.no_clip.store(no_clip, Ordering::Relaxed);
+        // Turning it off still glides with room made, back up to flat's 0 dB.
+        let sliders = if on { sliders } else { [0.0; 10] };
+        // 48 kHz stands in until a device opens and says otherwise; the curve barely
+        // differs at 44.1, and a device at anything else fits again (see `Eq::read`).
+        let rate = match self.rate.load(Ordering::Relaxed) {
+            0 => 48_000.0,
+            r => r as f64,
+        };
+        let target = fit(&sliders, rate);
+        let target_pre = if no_clip {
+            headroom_db(&target, rate)
+        } else {
+            0.0
+        };
+        let from = std::array::from_fn(|i| f32::from_bits(self.at[i].load(Ordering::Relaxed)));
+        let from_pre = f32::from_bits(self.at_pre.load(Ordering::Relaxed));
+        let floor = room(from, from_pre, target, target_pre, no_clip, rate);
+        for (a, g) in self.target.iter().zip(&target) {
+            a.store(g.to_bits(), Ordering::Relaxed);
+        }
+        self.target_pre.store(target_pre.to_bits(), Ordering::Relaxed);
+        self.floor.store(floor.to_bits(), Ordering::Relaxed);
+        self.fit_rate.store(rate as u32, Ordering::Relaxed);
         self.version.fetch_add(1, Ordering::Release);
     }
 }
@@ -298,6 +367,8 @@ impl Eq {
             frame: 0,
             active: false,
         };
+        // The setter fits the curve at the device's rate; this is where it's told.
+        eq.params.rate.store(rate.max(1), Ordering::Relaxed);
         // A device opened mid-song starts at the settings, not gliding up to them.
         eq.read();
         eq.step = eq.steps;
@@ -306,6 +377,7 @@ impl Eq {
         eq.pre_gain = 10f64.powf(eq.pre as f64 / 20.0);
         eq.coefs = design_all(&eq.gains, eq.rate);
         eq.active = eq.gains.iter().any(|g| *g != 0.0) || eq.pre != 0.0;
+        eq.publish();
         eq
     }
 
@@ -313,33 +385,53 @@ impl Eq {
     fn read(&mut self) {
         let p = &self.params;
         self.seen = p.version.load(Ordering::Acquire);
-        let on = p.on.load(Ordering::Relaxed);
-        let sliders = if on { std::array::from_fn(|i| f32::from_bits(p.gains[i].load(Ordering::Relaxed))) } else { [0.0; 10] };
-        // Turning it off still glides with room made, back up to flat's 0 dB.
-        let no_clip = p.no_clip.load(Ordering::Relaxed);
-        self.target = fit(&sliders, self.rate);
-        self.target_pre = if no_clip { headroom_db(&self.target, self.rate) } else { 0.0 };
+        let fitted = p.fit_rate.load(Ordering::Acquire) as f64 == self.rate;
+        let (target, target_pre, floor) = if fitted {
+            (
+                std::array::from_fn(|i| f32::from_bits(p.target[i].load(Ordering::Relaxed))),
+                f32::from_bits(p.target_pre.load(Ordering::Relaxed)),
+                f32::from_bits(p.floor.load(Ordering::Relaxed)),
+            )
+        } else {
+            // The curve was fitted at a rate this device doesn't run (settings set before
+            // it opened, or a swap to one at another rate): fit here, once, where the
+            // rate is known. The setter fits at ours from now on.
+            let sliders = if p.on.load(Ordering::Relaxed) {
+                std::array::from_fn(|i| f32::from_bits(p.gains[i].load(Ordering::Relaxed)))
+            } else {
+                [0.0; 10]
+            };
+            let no_clip = p.no_clip.load(Ordering::Relaxed);
+            let target = fit(&sliders, self.rate);
+            let target_pre = if no_clip {
+                headroom_db(&target, self.rate)
+            } else {
+                0.0
+            };
+            let floor = room(self.gains, self.pre, target, target_pre, no_clip, self.rate);
+            (target, target_pre, floor)
+        };
         self.from = self.gains;
         self.from_pre = self.pre;
-        let far = (0..BANDS.len()).map(|i| (self.target[i] - self.from[i]).abs()).fold(0.0, f32::max);
-        self.floor = self.from_pre.min(self.target_pre);
-        if no_clip {
-            // Partway, the curve can peak higher than at either end, so the level makes
-            // room for the loudest of a few points along the way (finer found under 0.05 dB
-            // more, inside the margin `headroom_db` leaves), and for how far filters on the
-            // move throw a low tone past it: ~0.55 dB lifting a big cut off sub-bass. Under
-            // 20 Hz, where music hardly goes, a full-scale tone can still go ~0.5 dB over
-            // for a moment; making room for that too would dip the level on every drag.
-            let partway = (1..8).map(|k| headroom_db(&std::array::from_fn(|i| lerp(self.from[i], self.target[i], k as f32 / 8.0)), self.rate));
-            let room = partway.fold(self.target_pre, f32::min) - (far * 0.06).min(1.0);
-            // Taken from what's needed, not from where the level is, so a drag restarting
-            // this every few blocks doesn't sink it further each time.
-            self.floor = self.floor.min(room);
-        }
+        self.target = target;
+        self.target_pre = target_pre;
+        self.floor = floor;
+        self.publish();
+        let far = (0..BANDS.len())
+            .map(|i| (self.target[i] - self.from[i]).abs())
+            .fold(0.0, f32::max);
         let steps = |db: f32| (db / STEP_DB).ceil() as u32;
         (self.down, self.moving) = (steps(self.from_pre - self.floor), (far / MOVE_DB).ceil() as u32);
         self.step = 0;
         self.steps = self.down + self.moving + SETTLE + steps(self.target_pre - self.floor);
+    }
+
+    /// Where the filters and level are, for the next `set` to measure room from.
+    fn publish(&self) {
+        for (a, g) in self.params.at.iter().zip(&self.gains) {
+            a.store(g.to_bits(), Ordering::Relaxed);
+        }
+        self.params.at_pre.store(self.pre.to_bits(), Ordering::Relaxed);
     }
 
     /// Once a block: take new settings, and move everything a step towards them.
@@ -376,6 +468,10 @@ impl Eq {
                 self.pre_ramp = (10f64.powf(pre as f64 / 20.0) - self.pre_gain) / self.block as f64;
             }
             self.active = true;
+            // Where the filters and level now are, for the next `set` to measure from.
+            // One block's move is under a tenth of a dB: the setter seeing it a moment
+            // late is inside every margin `room` already leaves.
+            self.publish();
         }
         if self.active {
             // Silence (pause) would otherwise ring the delays down into denormals, which

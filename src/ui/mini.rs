@@ -35,8 +35,6 @@ const MAX_W: f32 = 720.0;
 const SEEK_BAND: f32 = 14.0;
 /// Kept above other windows until unpinned.
 const PINNED_BY_DEFAULT: bool = true;
-/// What the strip's × does.
-const CLOSE: CloseButton = CloseButton::LikeFullWindow;
 /// From the work area's corner, the first time.
 const MARGIN: f32 = 16.0;
 /// Picture in picture: the mini player for a video, when first opened, and as small and
@@ -154,15 +152,6 @@ fn mini_size() -> Vec2 {
 
 fn width_limits() -> (f32, f32) {
     if video_active() { (VIDEO_MIN.x, VIDEO_MAX.x) } else { (MIN_W, MAX_W) }
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq)]
-enum CloseButton {
-    /// What the full window's × does: quit, or hide to the tray with "Close to tray".
-    LikeFullWindow,
-    /// Back to the full window (the expand button's job too).
-    Expand,
 }
 
 /// Where a window was: its outer corner in physical pixels, its inner size in points,
@@ -776,10 +765,7 @@ pub fn strip(app: &mut App, ui: &mut Ui, now: f64) {
     };
     // The system's frame has its own close button.
     if titlebar::custom() && top_btn(ui, icon::X, "close", "Close", true, false) {
-        match CLOSE {
-            CloseButton::LikeFullWindow => ctx.send_viewport_cmd(ViewportCommand::Close),
-            CloseButton::Expand => app.actions.push(Action::Mini(false)),
-        }
+        ctx.send_viewport_cmd(ViewportCommand::Close);
     }
     if top_btn(ui, icon::MAXIMIZE_2, "full", "Full window (Ctrl+M)", false, false) {
         app.actions.push(Action::Mini(false));
@@ -930,22 +916,22 @@ pub fn video_pip(app: &mut App, ui: &mut Ui, _now: f64) {
     }
     ui.painter().rect_filled(r, 0.0, Color32::BLACK);
     let track = app.current().cloned();
-    let video = track.as_ref().filter(|t| app.video_mode(t));
-    let frame = video.and_then(|t| super::nowplaying::video_frame(app, &ctx, t));
+    let video = app.shown_video().cloned();
+    let frame = video.as_ref().and_then(|t| super::nowplaying::video_frame(app, &ctx, t));
     // The window takes its shape (see `keep_shape`); a song without a video leaves it be.
     app.mini.video_shape = frame.as_ref().map(|tex| tex.size_vec2()).filter(|s| s.x > 0.0 && s.y > 0.0).map(|s| s.x / s.y);
-    match (&frame, &track) {
-        (Some(tex), _) => {
+    match (&frame, &video, &track) {
+        (Some(tex), _, _) => {
             let size = tex.size_vec2();
             let fit = size * (r.width() / size.x).min(r.height() / size.y);
             egui::Image::from_texture((tex.id(), fit)).paint_at(ui, Rect::from_center_size(r.center(), fit));
         }
-        (None, Some(t)) if video.is_some() => {
+        (None, Some(v), _) => {
             let fit = vec2(16.0, 9.0) * (r.width() / 16.0).min(r.height() / 9.0);
-            super::nowplaying::video_placeholder(ui, Rect::from_center_size(r.center(), fit), t, 0.0);
+            super::nowplaying::video_placeholder(ui, Rect::from_center_size(r.center(), fit), v, 0.0);
         }
-        (None, Some(t)) => paint_cover(ui, Rect::from_center_size(r.center(), Vec2::splat(r.height() - 24.0)), &t.thumbs, theme::thumb_radius() + 2.0, 1.0),
-        (None, None) => icon_at(ui, r.center(), icon::MUSIC, 32.0, theme::text_faint()),
+        (None, None, Some(t)) => paint_cover(ui, Rect::from_center_size(r.center(), Vec2::splat(r.height() - 24.0)), &t.thumbs, theme::thumb_radius() + 2.0, 1.0),
+        (None, None, None) => icon_at(ui, r.center(), icon::MUSIC, 32.0, theme::text_faint()),
     }
 
     // The controls, while pointed at (or one has the keyboard).
@@ -1011,10 +997,7 @@ pub fn video_pip(app: &mut App, ui: &mut Ui, _now: f64) {
         live(&resp)
     };
     if titlebar::custom() && corner(ui, icon::X, "close", "Close") {
-        match CLOSE {
-            CloseButton::LikeFullWindow => ctx.send_viewport_cmd(ViewportCommand::Close),
-            CloseButton::Expand => app.actions.push(Action::Mini(false)),
-        }
+        ctx.send_viewport_cmd(ViewportCommand::Close);
     }
     if corner(ui, icon::MAXIMIZE_2, "full", "Full window (Ctrl+M)") {
         app.actions.push(Action::Mini(false));

@@ -111,7 +111,7 @@ pub(super) fn dev_screenshot(ctx: &egui::Context, now: f64) {
 
 /// Dev hook: `YTM_SCRIPT="<secs>:<step>;…"` drives a test window that has no mouse or
 /// keyboard, with seconds from the first frame. Steps: `m:x,y` moves the pointer, `c:x,y`
-/// clicks, `r:w,h` resizes, `t:text` types, `s:name` saves `<YTM_SCRIPT_DIR>/name.png`, `q` quits.
+/// clicks, `d:x,y` and `u:x,y` press and let go there (a drag, with moves between), `r:w,h` resizes, `t:text` types, `f:n` flicks a touchpad n pixels (down) over 0.1 s, as Wayland sends it, `s:name` saves `<YTM_SCRIPT_DIR>/name.png`, `q` quits.
 pub(super) fn dev_script(ctx: &egui::Context, raw: &mut egui::RawInput) {
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -120,6 +120,7 @@ pub(super) fn dev_script(ctx: &egui::Context, raw: &mut egui::RawInput) {
         Press(egui::Pos2, bool),
         Resize(egui::Pos2),
         Text(&'static str),
+        Swipe(egui::TouchPhase, f32),
         Shot(&'static str),
         Quit,
     }
@@ -137,8 +138,18 @@ pub(super) fn dev_script(ctx: &egui::Context, raw: &mut egui::RawInput) {
             match (kind, point(value)) {
                 ("m", Some(p)) => steps.push((at, Step::Move(p))),
                 ("c", Some(p)) => steps.extend([(at, Step::Move(p)), (at + 0.2, Step::Press(p, true)), (at + 0.3, Step::Press(p, false))]),
+                // Press and let go as two steps, with moves between them: a drag.
+                ("d", Some(p)) => steps.extend([(at, Step::Move(p)), (at, Step::Press(p, true))]),
+                ("u", Some(p)) => steps.extend([(at, Step::Move(p)), (at, Step::Press(p, false))]),
                 ("r", Some(p)) => steps.push((at, Step::Resize(p))),
                 ("t", _) => steps.push((at, Step::Text(value))),
+                ("f", _) if value.parse::<f32>().is_ok() => {
+                    // 6 moves 20 ms apart, then the fingers lift (Wayland's axis stop).
+                    let n: f32 = value.parse().unwrap_or(0.0);
+                    steps.push((at, Step::Swipe(egui::TouchPhase::Start, n / 6.0)));
+                    steps.extend((1..6).map(|i| (at + 0.02 * f64::from(i), Step::Swipe(egui::TouchPhase::Move, n / 6.0))));
+                    steps.push((at + 0.11, Step::Swipe(egui::TouchPhase::End, 0.0)));
+                }
                 ("s", _) => steps.push((at, Step::Shot(value))),
                 ("q", _) => steps.push((at, Step::Quit)),
                 _ => log::warn!("YTM_SCRIPT: can't read {step}"),
@@ -156,6 +167,8 @@ pub(super) fn dev_script(ctx: &egui::Context, raw: &mut egui::RawInput) {
             Step::Press(p, pressed) => raw.events.push(egui::Event::PointerButton { pos: *p, button: egui::PointerButton::Primary, pressed: *pressed, modifiers: egui::Modifiers::NONE }),
             Step::Resize(p) => ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(p.to_vec2())),
             Step::Text(text) => raw.events.push(egui::Event::Text((*text).to_owned())),
+            // A touchpad flick, as Wayland sends it: points, with a phase each.
+            Step::Swipe(phase, n) => raw.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -*n), phase: *phase, modifiers: egui::Modifiers::NONE, source: egui::MouseWheelSource::Unknown }),
             Step::Shot(name) => {
                 let path = std::path::Path::new(dev_var("YTM_SCRIPT_DIR").unwrap_or(".")).join(format!("{name}.png"));
                 ctx.request_screenshot(move |img| {

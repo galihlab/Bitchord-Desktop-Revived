@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::backend::Collection;
+use crate::backend::{Collection, PlaylistSort};
 use crate::model::Track;
 
 /// Liked Music's playlist id.
@@ -18,6 +18,35 @@ const REFRESH_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How many albums and playlists stay kept. The page on screen, what's playing, one
 /// still loading and Liked Music aren't the ones dropped.
 const KEEP_OPENED: usize = 8;
+
+/// A row taken out of a list here, to put back with an Undo: where it was, its song and
+/// entry, and the nearest entry above it (`None`: none was).
+pub struct Taken {
+    at: usize,
+    pub track: Track,
+    pub set_id: Option<String>,
+    below: Option<String>,
+}
+
+/// Rows `rows` (sorted) of `c`, about to be taken out.
+pub fn taken(c: &Collection, rows: &[usize]) -> Vec<Taken> {
+    rows.iter()
+        .map(|&r| Taken {
+            at: r,
+            track: c.tracks[r].clone(),
+            set_id: c.set_ids.get(r).cloned().flatten(),
+            // Taken too or not: those are put back first.
+            below: c.set_ids[..r.min(c.set_ids.len())].iter().rev().find_map(Clone::clone),
+        })
+        .collect()
+}
+
+/// Likes taken away here, to put back with an Undo: their rows in Liked Music, and
+/// their edits from before.
+pub struct Unliked {
+    rows: Vec<Taken>,
+    was: Vec<(String, Option<LikeEdit>)>,
+}
 
 /// An album or playlist page kept for going back to.
 pub struct Opened {
@@ -218,6 +247,56 @@ impl Lists {
         }
     }
 
+    /// Rows taken out of `list` here that stay after all (an Undo, before YouTube Music
+    /// was told): loads list them again, and the kept copy has them back below the entry
+    /// each was below, or failing that where it was.
+    pub fn put_back(&mut self, list: &str, rows: Vec<Taken>) {
+        if let Some((gone, _)) = self.edits.removals.get_mut(list) {
+            for s in rows.iter().filter_map(|t| t.set_id.as_ref()) {
+                gone.remove(s);
+            }
+            if gone.is_empty() {
+                self.edits.removals.remove(list);
+            }
+        }
+        let Some(c) = self.collection_mut(list) else { return };
+        for t in rows {
+            // Already back, from a load since.
+            let same = |(x, s): (&Track, &Option<String>)| if t.set_id.is_some() { *s == t.set_id } else { x.id == t.track.id };
+            if c.tracks.iter().zip(&c.set_ids).any(same) {
+                continue;
+            }
+            let i = t.below.as_ref().and_then(|b| c.set_ids.iter().position(|s| s.as_ref() == Some(b))).map_or(t.at, |i| i + 1).min(c.tracks.len());
+            c.tracks.insert(i, t.track);
+            c.set_ids.insert(i.min(c.set_ids.len()), t.set_id);
+            c.count = c.count.map(|n| n + 1);
+        }
+    }
+
+    /// Likes about to be taken away here: their rows in Liked Music as kept, and their
+    /// edits, to put back with an Undo.
+    pub fn unliking(&self, tracks: &[Track]) -> Unliked {
+        let rows = self.get(LIKED_MUSIC).map_or_else(Vec::new, |o| {
+            let mut at: Vec<usize> = tracks.iter().filter_map(|t| o.c.tracks.iter().position(|x| x.id == t.id)).collect();
+            at.sort_unstable();
+            taken(&o.c, &at)
+        });
+        Unliked { rows, was: tracks.iter().map(|t| (t.id.clone(), self.edits.likes.get(&t.id).cloned())).collect() }
+    }
+
+    /// Likes taken away here that stay after all (an Undo, before YouTube Music was told):
+    /// their edits as they were (a like made here a moment before stays one), and their
+    /// rows back in Liked Music as kept.
+    pub fn unlike_undone(&mut self, u: Unliked) {
+        for (id, was) in u.was {
+            match was {
+                Some(e) => self.edits.likes.insert(id, e),
+                None => self.edits.likes.remove(&id),
+            };
+        }
+        self.put_back(LIKED_MUSIC, u.rows);
+    }
+
     /// Likes made here show at once in Liked Music as kept. (A whole reload asked for just
     /// before can still come back without them.)
     pub fn set_liked(&mut self, tracks: &[Track], like: bool) {
@@ -266,10 +345,12 @@ const LIKE_UNANSWERED: Duration = Duration::from_secs(600);
 #[derive(Default)]
 pub struct RecentEdits {
     /// Song: liked or not, the song when known (to put back a like the list lacks yet), and when.
-    likes: HashMap<String, (bool, Option<Track>, EditAge)>,
+    likes: HashMap<String, LikeEdit>,
     /// Playlist: the entries (`setVideoId`s) taken out of it, and when.
     removals: HashMap<String, (HashSet<String>, EditAge)>,
 }
+
+type LikeEdit = (bool, Option<Track>, EditAge);
 
 #[derive(Clone, Copy)]
 struct EditAge {
@@ -359,11 +440,83 @@ impl RecentEdits {
     }
 }
 
+/// How many times a sorted playlist loads again for its new order, after the load right
+/// after YouTube Music took it; each waits [`SORT_WAIT`] longer than the last.
+const SORT_TRIES: u32 = 4;
+const SORT_WAIT: f64 = 2.0;
+
+/// One of YouTube Music's sorts asked of your own playlist, until the playlist loads in
+/// that order. Its answer comes before its reads have caught up: a load right after it
+/// can still bring the old order (with the old one ticked), so it loads again a little
+/// later, a few times at most.
+pub struct SortWait {
+    /// What was sent: the order that's ticked once it's in.
+    actions: serde_json::Value,
+    /// YouTube Music took it; the loads from then on are looked at.
+    taken: bool,
+    /// Loads asked for since, after the first.
+    tries: u32,
+    /// When to load it again; `None` while a load is awaited.
+    due: Option<f64>,
+}
+
+impl SortWait {
+    pub fn new(actions: serde_json::Value) -> Self {
+        Self { actions, taken: false, tries: 0, due: None }
+    }
+
+    /// YouTube Music took the sort; the playlist is loading again.
+    pub fn taken(&mut self) {
+        self.taken = true;
+    }
+
+    /// The playlist's first page came in, with its sorts: true when it's in the order
+    /// asked for, or when it's been tried enough (it stays as YouTube Music lists it).
+    /// Otherwise it's to load again at [`Self::due`].
+    pub fn arrived(&mut self, sorts: &[PlaylistSort], now: f64) -> bool {
+        if !self.taken {
+            return false;
+        }
+        if sorts.iter().any(|s| s.on && s.actions == self.actions) {
+            return true;
+        }
+        // Another load meanwhile (going back to it) leaves the one waiting as it was.
+        if self.due.is_some() {
+            return false;
+        }
+        if self.tries >= SORT_TRIES {
+            return true;
+        }
+        self.tries += 1;
+        self.due = Some(now + SORT_WAIT * self.tries as f64);
+        false
+    }
+
+    /// Taken, and a load of it is awaited, not waiting to load again.
+    pub fn awaiting(&self) -> bool {
+        self.taken && self.due.is_none()
+    }
+
+    /// When it's to load again, if it's waiting to.
+    pub fn due(&self) -> Option<f64> {
+        self.due
+    }
+
+    /// It's time (`now`) to load it again: true once, and it awaits that load.
+    pub fn take_due(&mut self, now: f64) -> bool {
+        let ready = self.due.is_some_and(|d| now >= d);
+        if ready {
+            self.due = None;
+        }
+        ready
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{Arrival, Collection, Done, LIKED_MUSIC, Lists, RecentEdits, Start, Track};
+    use super::{Arrival, Collection, Done, LIKED_MUSIC, Lists, PlaylistSort, RecentEdits, SORT_TRIES, SortWait, Start, Track, taken};
 
     fn track(id: &str) -> Track {
         Track { id: id.into(), title: id.into(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, ..Default::default() }
@@ -383,6 +536,7 @@ mod tests {
             set_ids: songs.iter().map(|s| Some(format!("set-{s}"))).collect(),
             count: Some(songs.len() as u64),
             owned: true,
+            sorts: Vec::new(),
         }
     }
 
@@ -398,6 +552,75 @@ mod tests {
 
     fn page_of(songs: &[&str]) -> (Vec<Track>, Vec<Option<String>>) {
         (songs.iter().map(|s| track(s)).collect(), songs.iter().map(|s| Some(format!("set-{s}"))).collect())
+    }
+
+    /// Rows taken out of a kept playlist the way a removal does, kept to put back.
+    fn take(lists: &mut Lists, id: &str, rows: &[usize]) -> Vec<super::Taken> {
+        let c = lists.collection_mut(id).unwrap();
+        let gone = taken(c, rows);
+        c.remove_rows(rows);
+        lists.edits.remove(id, gone.iter().map(|t| t.set_id.clone().unwrap()));
+        gone
+    }
+
+    #[test]
+    fn rows_put_back_go_where_they_were_and_loads_list_them_again() {
+        let mut lists = Lists::default();
+        let load = lists.load("PL1", false, false).unwrap().load;
+        lists.arrived(load, collection("PL1", &["a", "b", "c", "d", "e"]), false, &[]).unwrap();
+        // Next to each other, and the last.
+        let gone = take(&mut lists, "PL1", &[1, 2, 4]);
+        assert_eq!(songs(&lists, "PL1"), ["a", "d"]);
+        // A reload meanwhile, with a song added elsewhere at the top: the taken stay out.
+        let load = lists.load("PL1", false, false).unwrap().load;
+        lists.arrived(load, collection("PL1", &["x", "a", "b", "c", "d", "e"]), false, &[]).unwrap();
+        assert_eq!(songs(&lists, "PL1"), ["x", "a", "d"]);
+        lists.put_back("PL1", gone);
+        assert_eq!(songs(&lists, "PL1"), ["x", "a", "b", "c", "d", "e"]);
+        assert_eq!(lists.get("PL1").unwrap().c.count, Some(6));
+        // And loads no longer leave them out.
+        let load = lists.load("PL1", false, false).unwrap().load;
+        lists.arrived(load, collection("PL1", &["a", "b", "c", "d", "e"]), false, &[]).unwrap();
+        assert_eq!(songs(&lists, "PL1"), ["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn rows_already_back_arent_put_back_twice() {
+        let mut lists = Lists::default();
+        let load = lists.load("PL1", false, false).unwrap().load;
+        lists.arrived(load, collection("PL1", &["a", "b"]), false, &[]).unwrap();
+        let gone = take(&mut lists, "PL1", &[0]);
+        lists.collection_mut("PL1").unwrap().tracks.insert(0, track("a"));
+        lists.collection_mut("PL1").unwrap().set_ids.insert(0, Some("set-a".into()));
+        lists.put_back("PL1", gone);
+        assert_eq!(songs(&lists, "PL1"), ["a", "b"]);
+    }
+
+    #[test]
+    fn an_unlike_undone_leaves_liked_music_as_it_was() {
+        let mut lists = Lists::default();
+        let load = lists.load(LIKED_MUSIC, false, false).unwrap().load;
+        lists.arrived(load, collection(LIKED_MUSIC, &["x", "y", "z"]), false, &[]).unwrap();
+        let was = lists.unliking(&[track("y")]);
+        lists.set_liked(&[track("y")], false);
+        assert_eq!(songs(&lists, LIKED_MUSIC), ["x", "z"]);
+        lists.unlike_undone(was);
+        assert_eq!(songs(&lists, LIKED_MUSIC), ["x", "y", "z"]);
+        // A first page without it doesn't get it at the top: it was never liked here.
+        let load = lists.load(LIKED_MUSIC, false, false).unwrap().load;
+        lists.arrived(load, collection(LIKED_MUSIC, &["x"]), true, &[]).unwrap();
+        assert_eq!(songs(&lists, LIKED_MUSIC), ["x"]);
+        // One liked here a moment before stays liked here: a load not listing it yet has it.
+        let mut lists = Lists::default();
+        let load = lists.load(LIKED_MUSIC, false, false).unwrap().load;
+        lists.arrived(load, collection(LIKED_MUSIC, &["x", "y", "z"]), false, &[]).unwrap();
+        lists.set_liked(&[track("n")], true);
+        let was = lists.unliking(&[track("n")]);
+        lists.set_liked(&[track("n")], false);
+        lists.unlike_undone(was);
+        let load = lists.load(LIKED_MUSIC, false, false).unwrap().load;
+        lists.arrived(load, collection(LIKED_MUSIC, &["x", "y", "z"]), false, &[]).unwrap();
+        assert_eq!(songs(&lists, LIKED_MUSIC), ["n", "x", "y", "z"]);
     }
 
     #[test]
@@ -610,5 +833,62 @@ mod tests {
         // A later page drops an unliked song too.
         assert!(!edits.keeps("LM", &track("x"), Some("set-x")));
         assert!(edits.keeps("PL9", &track("x"), Some("set-x")));
+    }
+
+    fn sorts(on: u64) -> Vec<PlaylistSort> {
+        [(0, "Manual"), (3, "Title")]
+            .into_iter()
+            .map(|(order, name)| PlaylistSort {
+                name: name.into(),
+                on: order == on,
+                manual: order == 0,
+                actions: serde_json::json!([{"action": "ACTION_SET_PLAYLIST_VIDEO_ORDER", "playlistVideoOrder": order}]),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sorted_playlist_loads_again_until_it_comes_in_that_order() {
+        let mut wait = SortWait::new(sorts(3)[1].actions.clone());
+        // A load from before YouTube Music took it doesn't count.
+        assert!(!wait.arrived(&sorts(0), 0.0));
+        assert_eq!(wait.due(), None);
+        wait.taken();
+        // Right after: still the old order. It loads again in a while, once.
+        assert!(!wait.arrived(&sorts(0), 10.0));
+        let due = wait.due().unwrap();
+        assert!(due > 10.0);
+        assert!(!wait.take_due(due - 0.1));
+        assert!(wait.take_due(due));
+        assert!(!wait.take_due(due + 1.0));
+        // Then it's in.
+        assert!(wait.arrived(&sorts(3), due + 1.0));
+    }
+
+    #[test]
+    fn a_sorted_playlist_stops_loading_again_after_a_few_tries() {
+        let mut wait = SortWait::new(sorts(3)[1].actions.clone());
+        wait.taken();
+        let mut now = 0.0;
+        let mut waits = Vec::new();
+        for _ in 0..SORT_TRIES {
+            assert!(!wait.arrived(&sorts(0), now));
+            let due = wait.due().unwrap();
+            waits.push(due - now);
+            assert!(wait.take_due(due));
+            now = due;
+        }
+        assert!(wait.arrived(&sorts(0), now));
+        // Each wait is longer than the last.
+        assert!(waits.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    #[test]
+    fn manual_order_counts_as_in_once_it_is_ticked() {
+        let mut wait = SortWait::new(sorts(0)[0].actions.clone());
+        wait.taken();
+        assert!(!wait.arrived(&sorts(3), 0.0));
+        assert!(wait.take_due(wait.due().unwrap()));
+        assert!(wait.arrived(&sorts(0), 5.0));
     }
 }

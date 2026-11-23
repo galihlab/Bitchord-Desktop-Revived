@@ -6,9 +6,9 @@ use std::sync::atomic::Ordering;
 use egui::{Align2, Color32, Rect, RichText, Sense, Ui, Vec2, pos2, vec2};
 
 use super::row_drag;
-use super::widgets::{self, RowOpts, card, chip, h_scroll, named, paint_cover, pill, shelf_header, track_row};
-use super::{Action, App, LibTab, Page, ProviderVerdicts, Selection};
-use crate::backend::compact;
+use super::widgets::{self, RowOpts, card, chip, h_scroll, named, paint_cover, pill, shelf_header, shelf_header_ext, track_row, video_card};
+use super::{Action, App, HomeRows, LibTab, Page, ProviderVerdicts, Selection};
+use crate::backend::{PlaylistSort, compact};
 use crate::model::{Card, ShelfKind, Target, Track};
 use crate::theme::{self, icon};
 
@@ -29,16 +29,19 @@ fn feed_columns(width: f32, square: bool) -> usize {
     }
 }
 
-/// One tile of an Apple feed row: a share of the content on wide windows, the site's
-/// own narrow width below its breakpoint.
+/// One tile of an Apple feed row: a share of the content on wide windows (the
+/// site's own breakpoints), and below them as many whole tiles as the width
+/// holds. The site's fixed narrow tile left a stub of the next card hanging off
+/// the edge, with room for a whole one beside it; tiling leaves neither.
 fn feed_tile(ui: &Ui, square: bool) -> f32 {
     let width = ui.available_width();
-    let min = if square { 144.0 } else { 270.0 };
-    if width < 1024.0 {
-        return min;
+    let min = if square { 144.0 } else { 240.0 };
+    if width >= 1024.0 {
+        let cols = feed_columns(width, square);
+        return ((width - 20.0 * (cols - 1) as f32) / cols as f32).max(min);
     }
-    let cols = feed_columns(width, square);
-    ((width - 20.0 * (cols - 1) as f32) / cols as f32).max(min)
+    let cols = (((width + 20.0) / (min + 20.0)).floor() as usize).max(1);
+    (width - 20.0 * (cols - 1) as f32) / cols as f32
 }
 
 pub fn page(app: &mut App, ui: &mut Ui, now: f64) {
@@ -134,6 +137,7 @@ impl Rows {
     pub(super) fn opts(&self, liked: &HashSet<String>, t: &Track, number: Option<usize>, show_album: bool) -> RowOpts {
         RowOpts {
             number,
+            rank: false,
             show_album,
             current: self.current.as_deref() == Some(t.id.as_str()),
             playing: self.playing,
@@ -193,14 +197,19 @@ fn circle_action(ui: &mut Ui, glyph: CircleGlyph, name: &str, active: bool) -> e
 
 /// A page's main Play button. Shows Pause while this page's album / playlist / artist
 /// is playing, and toggles instead of restarting when it's already loaded.
-fn play_pill(ui: &mut Ui, acts: &mut Vec<Action>, target: &Target, tracks: &[Track]) {
+fn play_pill(ui: &mut Ui, acts: &mut Vec<Action>, target: &Target, tracks: &[Track], order: Option<&[usize]>) {
     let active = widgets::active_state(ui, target);
     let (label, glyph) = if active == Some(true) { ("Pause", icon::PAUSE) } else { ("Play", icon::PLAY) };
     if pill(ui, label, Some(glyph), true).clicked() {
         if active.is_some() {
             acts.push(Action::TogglePlay);
         } else if !tracks.is_empty() {
-            acts.push(Action::Play(tracks.to_vec(), 0));
+            // All of it from the top, in the order it's sorted.
+            let plays = match order {
+                Some(o) => o.iter().map(|&i| tracks[i].clone()).collect(),
+                None => tracks.to_vec(),
+            };
+            acts.push(Action::Play(plays, 0));
         }
     }
 }
@@ -209,14 +218,69 @@ fn card_row(ui: &mut Ui, id: &str, title: &str, cards: &[Card], acts: &mut Vec<A
     if cards.is_empty() {
         return;
     }
-    let (l, r) = shelf_header(ui, title, None, None, true);
-    let nudge = r as i32 - l as i32;
-    let tile = feed_tile(ui, true);
-    h_scroll(ui, id, nudge, cards.len(), tile, 20.0, |ui| {
-        ui.spacing_mut().item_spacing.x = 20.0;
-        for c in cards {
-            card(ui, c, tile, false, acts);
+    reveal(ui, id, |ui| {
+        let (l, r) = shelf_header(ui, title, None, None, widgets::shelf_overflows(ui, id));
+        let nudge = r as i32 - l as i32;
+        let tile = feed_tile(ui, true);
+        h_scroll(ui, id, nudge, cards.len(), tile, 20.0, |ui| {
+            ui.spacing_mut().item_spacing.x = 20.0;
+            for c in cards {
+                card(ui, c, tile, false, None, acts);
+            }
+        });
+    });
+}
+
+/// A shelf of Mochy's concert cards: video frames a little wider than tall, the
+/// title and who it's by over a scrim at the top. Empty shelves leave no gap.
+fn video_row(ui: &mut Ui, id: &str, title: &str, cards: &[Card], acts: &mut Vec<Action>) {
+    if cards.is_empty() {
+        return;
+    }
+    reveal(ui, id, |ui| {
+        let (l, r) = shelf_header(ui, title, None, None, widgets::shelf_overflows(ui, id));
+        let nudge = r as i32 - l as i32;
+        // four across a wide window, the frames keeping the phone card's proportions;
+        // on a narrower one, fewer and wider rather than a frame cut off at the edge
+        let width = ui.available_width();
+        let mut cols = 4.0;
+        while cols > 1.0 && (width - 20.0 * (cols - 1.0)) / cols < 240.0 {
+            cols -= 1.0;
         }
+        let tile = ((width - 20.0 * (cols - 1.0)) / cols).min(330.0).min(width - 40.0);
+        h_scroll(ui, id, nudge, cards.len(), tile, 20.0, |ui| {
+            ui.spacing_mut().item_spacing.x = 20.0;
+            for c in cards {
+                video_card(ui, c, tile, acts);
+            }
+        });
+    });
+}
+
+/// A shelf's first appearance on screen: it fades in over half a second, the way
+/// Mochy's TV rows reveal as the list carries them in — rows rise out of the page
+/// instead of sitting there. Once it's played, it stays.
+fn reveal(ui: &mut Ui, id: &str, body: impl FnOnce(&mut Ui)) {
+    let vid = egui::Id::unique(("shelf-reveal", id));
+    let now = ui.ctx().input(|i| i.time);
+    // anything at or above the view's bottom edge has been reached; below the
+    // fold, a shelf keeps still until the scroll brings it in
+    let top = ui.cursor().top();
+    let on_screen = top <= ui.clip_rect().bottom();
+    let mut start = ui.ctx().data(|d| d.get_temp::<f64>(vid)).unwrap_or(f64::INFINITY);
+    if start.is_infinite() && on_screen {
+        start = now;
+    }
+    let t = if start.is_finite() { (((now - start) / 0.45) as f32).clamp(0.0, 1.0) } else { 0.0 };
+    if t < 1.0 {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+    }
+    // re-set every frame: temp data dies two frames after its last write
+    ui.ctx().data_mut(|d| d.insert_temp(vid, start));
+    let te = theme::ease_out(t);
+    ui.scope(|ui| {
+        ui.set_opacity(0.05 + 0.95 * te);
+        body(ui);
     });
 }
 
@@ -226,7 +290,7 @@ fn card_row_all(ui: &mut Ui, id: &str, title: &str, cards: &[Card], all: bool, a
     if cards.is_empty() {
         return;
     }
-    let (l, r, show_all) = widgets::shelf_header_ext(ui, title, None, None, true, all);
+    let (l, r, show_all) = widgets::shelf_header_ext(ui, title, None, None, widgets::shelf_overflows(ui, id), all);
     if show_all {
         acts.push(open());
     }
@@ -235,7 +299,7 @@ fn card_row_all(ui: &mut Ui, id: &str, title: &str, cards: &[Card], all: bool, a
     h_scroll(ui, id, nudge, cards.len(), tile, 20.0, |ui| {
         ui.spacing_mut().item_spacing.x = 20.0;
         for c in cards {
-            card(ui, c, tile, false, acts);
+            card(ui, c, tile, false, None, acts);
         }
     });
 }
@@ -244,7 +308,7 @@ fn card_row_all(ui: &mut Ui, id: &str, title: &str, cards: &[Card], all: bool, a
 /// song starts its radio. Returns whether the arrows reached the end.
 #[allow(clippy::too_many_arguments)]
 fn song_grid(ui: &mut Ui, rows_ctx: &Rows, liked: &HashSet<String>, acts: &mut Vec<Action>, id: &str, title: &str, strap: Option<&str>, tracks: &[Track], rows: usize) -> bool {
-    let (l, r) = shelf_header(ui, title, strap, None, true);
+    let (l, r) = shelf_header(ui, title, strap, None, widgets::shelf_overflows(ui, id));
     let nudge = r as i32 - l as i32;
     let col_w = feed_tile(ui, false);
     let tracks: Vec<&Track> = tracks.iter().filter(|t| rows_ctx.shows(t)).collect();
@@ -282,26 +346,36 @@ struct ListCtx<'a> {
 /// A long song list; only the rows on screen are built. Clicking one plays `tracks` from it,
 /// or picks it while selecting: Ctrl-click picks one song, Shift-click a run of them.
 #[allow(clippy::too_many_arguments)]
-fn list(ui: &mut Ui, rows: &Rows, liked: &HashSet<String>, tracks: &[Track], show_album: bool, number: impl Fn(usize, &Track) -> Option<usize>, cx: ListCtx, drag: &mut Option<row_drag::RowDrag>, drag_list: egui::Id, acts: &mut Vec<Action>) {
+fn list(ui: &mut Ui, rows: &Rows, liked: &HashSet<String>, tracks: &[Track], order: Option<&[usize]>, show_album: bool, number: impl Fn(usize, &Track) -> Option<usize>, cx: ListCtx, drag: &mut Option<row_drag::RowDrag>, drag_list: egui::Id, acts: &mut Vec<Action>) {
     let ListCtx { sel, page, own } = cx;
     let selecting = sel.on(page);
     let mods = ui.input(|i| i.modifiers);
-    widgets::visible_rows(ui, tracks.len(), |ui, i| {
+    widgets::visible_rows(ui, order.map_or(tracks.len(), |o| o.len()), |ui, k| {
+        let i = order.map_or(k, |o| o[k]);
         let t = &tracks[i];
-        // Any song can be dragged onto a playlist in the sidebar.
-        row_drag::grip(ui, drag, drag_list, i, t);
-        let o = RowOpts {
-            selected: selecting.then(|| sel.rows.contains(&i)),
-            remove: own.then_some(i),
-            ..rows.opts(liked, t, number(i, t), show_album)
-        };
-        if track_row(ui, t, &o, acts).clicked() {
-            if selecting || mods.command || mods.shift {
-                sel.pick(page, i, mods.shift);
-            } else {
-                acts.push(Action::Play(tracks.to_vec(), i));
+        // Keyed on the song as well as the place: a song's open menu closes when the order
+        // changes under it, instead of turning into another song's.
+        ui.push_id(&t.id, |ui| {
+            // Any song can be dragged onto a playlist in the sidebar.
+            row_drag::grip(ui, drag, drag_list, i, t);
+            let o = RowOpts {
+                selected: selecting.then(|| sel.rows.contains(&i)),
+                remove: own.then_some(i),
+                ..rows.opts(liked, t, number(i, t), show_album)
+            };
+            if track_row(ui, t, &o, acts).clicked() {
+                if selecting || mods.command || mods.shift {
+                    // A run of picks is of the rows on show, in their order on screen.
+                    sel.pick(page, i, mods.shift, order);
+                } else if let Some(o) = order {
+                    // What's on show plays, in its order.
+                    let plays: Vec<Track> = o.iter().map(|&r| tracks[r].clone()).collect();
+                    acts.push(Action::Play(plays, k));
+                } else {
+                    acts.push(Action::Play(tracks.to_vec(), i));
+                }
             }
-        }
+        });
     });
     // These lists don't change order: a picked-up song is only carried out, onto a
     // playlist in the sidebar.
@@ -314,6 +388,64 @@ fn select_pill(ui: &mut Ui, sel: &mut Selection, page: &Page) {
     if pill(ui, if on { "Done" } else { "Select" }, Some(icon::LIST_CHECKS), false).clicked() {
         if on { sel.clear() } else { sel.start(page) }
     }
+}
+
+/// A list's Sort button, with its orders in a menu. Away while the list is still coming in.
+fn sort_pill(ui: &mut Ui, sorts: &mut super::sorts::ListSorts, page: &Page, held: bool) {
+    if let Some(list) = super::sorts::list_id(page) {
+        sort_pill_list(ui, sorts, page, &list, held);
+    }
+}
+
+/// The same Sort button for a list that isn't the page's only one (the Uploads page's
+/// local music): the page's orders, kept under the list's own id.
+fn sort_pill_list(ui: &mut Ui, sorts: &mut super::sorts::ListSorts, page: &Page, list: &str, held: bool) {
+    if held {
+        return;
+    }
+    let options = super::sorts::options(page);
+    let now = sorts.sort(list);
+    let label = match options.iter().find(|(s, _)| *s == now && now != super::sorts::Sort::Default) {
+        Some((_, name)) => format!("Sort: {name}"),
+        None => "Sort".to_owned(),
+    };
+    let resp = pill(ui, &label, None, false);
+    egui::Popup::menu(&resp).show(|ui| {
+        ui.set_width(190.0);
+        ui.add_space(3.0);
+        for (s, name) in options {
+            if widgets::menu_choice(ui, name, s == now) {
+                sorts.set_sort(list, s);
+            }
+        }
+        ui.add_space(3.0);
+    });
+}
+
+/// Your own playlist's Sort button: YouTube Music's orders, saved to the playlist as there,
+/// which then loads again in the new order. Away while the list is still coming in.
+fn saved_sort_pill(ui: &mut Ui, sorts: &mut super::sorts::ListSorts, id: &str, saved: &[PlaylistSort], busy: bool, sorting: bool, acts: &mut Vec<Action>) {
+    // It comes in the order picked here: none of the app's own sorts on top.
+    if sorts.sort(id) != super::sorts::Sort::Default {
+        sorts.set_sort(id, super::sorts::Sort::Default);
+    }
+    // One sort at a time: what's ticked is stale until the playlist has loaded again.
+    let label = match saved.iter().find(|s| s.on && !s.manual) {
+        _ if sorting => "Sorting…".to_owned(),
+        Some(s) => format!("Sort: {}", s.name),
+        None => "Sort".to_owned(),
+    };
+    let resp = ui.add_enabled_ui(!busy, |ui| pill(ui, &label, None, false)).inner;
+    egui::Popup::menu(&resp).show(|ui| {
+        ui.set_width(190.0);
+        ui.add_space(3.0);
+        for s in saved {
+            if widgets::menu_choice(ui, &s.name, s.on) && !s.on {
+                acts.push(Action::SortPlaylist(id.to_owned(), s.actions.clone()));
+            }
+        }
+        ui.add_space(3.0);
+    });
 }
 
 /// The songs a page lists, and whether they're your own playlist's.
@@ -336,7 +468,12 @@ fn selection_bar(app: &mut App, ctx: &egui::Context, page: &Page, area: Rect) {
     }
     let Some((tracks, own)) = selectable(app, page) else { return };
     let n = tracks.len();
-    let picked: Vec<Track> = app.selection.rows.iter().filter_map(|&i| tracks.get(i).cloned()).collect();
+    // In the order on screen.
+    let order = super::sorts::list_id(page).and_then(|l| app.sorts.order(&l, tracks));
+    let picked: Vec<Track> = match &order {
+        Some(s) => s.iter().filter(|i| app.selection.rows.contains(i)).map(|&i| tracks[i].clone()).collect(),
+        None => app.selection.rows.iter().filter_map(|&i| tracks.get(i).cloned()).collect(),
+    };
     let all = !picked.is_empty() && picked.len() == n;
     let all_liked = !picked.is_empty() && picked.iter().all(|t| app.liked.contains(&t.id));
     // Labelled buttons when there's room, icons with tooltips when the window is narrow.
@@ -376,6 +513,11 @@ fn selection_bar(app: &mut App, ctx: &egui::Context, page: &Page, area: Rect) {
                             if button(ui, "Add to queue", icon::LIST_MUSIC, false).clicked() {
                                 acts.extend(picked.iter().cloned().map(Action::Enqueue));
                             }
+                            // Local songs have nothing to download: their file is already here.
+                            let downloadable: Vec<Track> = picked.iter().filter(|t| !crate::local::is_local(&t.id)).cloned().collect();
+                            if !downloadable.is_empty() && !matches!(page, Page::Downloads) && button(ui, "Download", icon::DOWNLOAD, false).clicked() {
+                                acts.push(Action::DownloadMany(None, String::new(), Some(downloadable)));
+                            }
                         }
                         toggle_all = button(ui, if all { "Select none" } else { "Select all" }, icon::LIST_CHECKS, false).clicked();
                         done |= widgets::icon_button(ui, icon::X, 18.0, "Done selecting", false).clicked();
@@ -398,20 +540,58 @@ fn selection_bar(app: &mut App, ctx: &egui::Context, page: &Page, area: Rect) {
 // ------------------------------------------------------------------ home
 
 fn home(app: &mut App, ui: &mut Ui, now: f64) {
-    page_title(ui, "Home");
+    // No title of its own: the hero opens the page, the way Mochy's phone and TV
+    // homes both do — the stage is the greeting.
     // A refresh keeps showing the current feed; the skeleton is only for an empty one.
     if app.home.as_ref().is_none_or(|h| app.home_loading && h.shelves.is_empty()) {
         placeholder(app, ui, now, 3, CARD);
         return;
     }
     let rows = Rows::new(app, now);
-    let Some(h) = &app.home else { return };
-    if h.shelves.is_empty() {
+    // The hero that opens the page: what's playing, a roll, discoveries, playlists.
+    super::hero::draw(app, ui, now);
+    // The local rows and the recommendation rows, grown from what you play here,
+    // dealt one against the other the way Mochy's home deals its categories between
+    // its own rows — two of its own first, the releases after the first round of
+    // recommendation rows.
+    let reco: Vec<crate::recommend::Row> = app.reco.rows.clone();
+    let new_from = app.reco.new_from.clone();
+    if app.home.as_ref().is_none_or(|h| h.shelves.is_empty()) && reco.is_empty() && new_from.is_empty() && app.home_rows.is_empty() {
         ui.add_space(40.0);
         ui.label(RichText::new("Nothing here yet").color(theme::text_dim()));
     }
+    // Which local row is next: recently played and most played open the page, keep
+    // listening and the forgotten favourites follow against the recommendation rows.
+    let mut local = 0usize;
+    for (i, r) in reco.iter().enumerate() {
+        while local < if i == 0 { 2 } else { 1 } {
+            local = draw_local_row(&app.home_rows, local, ui, &rows, &app.liked, &mut app.actions);
+        }
+        if i == 3 && !new_from.is_empty() {
+            card_row(ui, "reco-new", "New from your artists", &new_from, &mut app.actions);
+        }
+        let id = format!("reco-{i}-{}", r.title);
+        reco_grid(ui, &rows, &app.liked, &mut app.actions, &id, r);
+    }
+    while local < 4 {
+        local = draw_local_row(&app.home_rows, local, ui, &rows, &app.liked, &mut app.actions);
+    }
+    if reco.len() < 3 && !new_from.is_empty() {
+        card_row(ui, "reco-new", "New from your artists", &new_from, &mut app.actions);
+    }
+    // From the community — playlists off the artists you play that aren't YouTube's
+    // own — and the live shows and music videos of theirs, as Mochy's concert cards:
+    // wide frames with the words laid over the top
+    video_row(ui, "local-community", "From the community", &app.community, &mut app.actions);
+    video_row(ui, "local-live", "Live shows", &app.live_shows, &mut app.actions);
+    video_row(ui, "local-videos", "Music videos for you", &app.videos_for_you, &mut app.actions);
+    let Some(h) = &app.home else { return };
     let mut more_picks = None;
     for (i, s) in h.shelves.iter().enumerate() {
+        // "All time hits" after the first feed shelf, the way Mochy slots the charts in
+        if i == 1 {
+            card_row(ui, "local-hits", "All time hits", &app.all_time_hits, &mut app.actions);
+        }
         let id = format!("home-{i}-{}", s.title);
         match &s.kind {
             ShelfKind::Cards(cards) => {
@@ -420,17 +600,19 @@ fn home(app: &mut App, ui: &mut Ui, now: f64) {
                     continue;
                 }
                 let (strap, thumb) = if s.title == "Listen again" { (None, None) } else { (s.strapline.as_deref(), s.strap_thumb.as_deref()) };
-                let (l, r) = shelf_header(ui, &s.title, strap, thumb, true);
-                let nudge = r as i32 - l as i32;
-                let tile = feed_tile(ui, true);
-                let acts = &mut app.actions;
-                let liked = &app.liked;
-                h_scroll(ui, &id, nudge, cards.len(), tile, 20.0, |ui| {
-                    ui.spacing_mut().item_spacing.x = 20.0;
-                    for c in cards {
-                        let is_liked = matches!(&c.target, Target::Song(t) if liked.contains(&t.id));
-                        card(ui, c, tile, is_liked, acts);
-                    }
+                reveal(ui, &id, |ui| {
+                    let (l, r) = shelf_header(ui, &s.title, strap, thumb, widgets::shelf_overflows(ui, &id));
+                    let nudge = r as i32 - l as i32;
+                    let tile = feed_tile(ui, true);
+                    let acts = &mut app.actions;
+                    let liked = &app.liked;
+                    h_scroll(ui, &id, nudge, cards.len(), tile, 20.0, |ui| {
+                        ui.spacing_mut().item_spacing.x = 20.0;
+                        for c in cards {
+                            let is_liked = matches!(&c.target, Target::Song(t) if liked.contains(&t.id));
+                            card(ui, c, tile, is_liked, None, acts);
+                        }
+                    });
                 });
             }
             ShelfKind::Songs { tracks, rows: n } => {
@@ -451,6 +633,123 @@ fn home(app: &mut App, ui: &mut Ui, now: f64) {
     if loading_more {
         widgets::skeleton(ui, now, 1, CARD);
     }
+}
+
+/// One of Home's local rows (the listening-history half): `which` — recently
+/// played (0), most played (1), keep listening (2), the forgotten favourites (3).
+/// Empty rows leave no gap: the count moves on either way. Returns the next row.
+fn draw_local_row(hr: &HomeRows, which: usize, ui: &mut Ui, rows_ctx: &Rows, liked: &HashSet<String>, acts: &mut Vec<Action>) -> usize {
+    match which {
+        0 => card_row(ui, "local-recent", "Recently played", &hr.recently_played, acts),
+        1 => {
+            if !hr.most_played.is_empty() {
+                ranked_grid(ui, rows_ctx, liked, acts, "local-most", "Most played", &hr.most_played);
+            }
+        }
+        2 => card_row(ui, "local-keep", "Keep listening", &hr.keep, acts),
+        _ => {
+            if !hr.forgotten.is_empty() {
+                song_grid(ui, rows_ctx, liked, acts, "local-forgotten", "Don't forget these songs", None, &hr.forgotten, 3);
+            }
+        }
+    }
+    which + 1
+}
+
+/// "Most played", each song with its rank in front of it — Mochy's HomeTrackGrid.
+fn ranked_grid(ui: &mut Ui, rows_ctx: &Rows, liked: &HashSet<String>, acts: &mut Vec<Action>, id: &str, title: &str, tracks: &[Track]) {
+    reveal(ui, id, |ui| {
+        let (l, r) = shelf_header(ui, title, None, None, widgets::shelf_overflows(ui, id));
+        let nudge = r as i32 - l as i32;
+        let col_w = feed_tile(ui, false);
+        let tracks: Vec<&Track> = tracks.iter().filter(|t| rows_ctx.shows(t)).collect();
+        let mut picked = None;
+        h_scroll(ui, id, nudge, tracks.len().div_ceil(3), col_w, 20.0, |ui| {
+            ui.spacing_mut().item_spacing.x = 20.0;
+            for (c, col) in tracks.chunks(3).enumerate() {
+                ui.allocate_ui(vec2(col_w, 3.0 * 60.0), |ui| {
+                    ui.set_width(col_w);
+                    ui.vertical(|ui| {
+                        for (i, t) in col.iter().enumerate() {
+                            // the rank, not a track number: 1 to 20 in front of each song
+                            let o = rows_ctx.opts(liked, t, Some(c * 3 + i + 1), false);
+                            let o = RowOpts { rank: true, ..o };
+                            if track_row(ui, t, &o, acts).clicked() {
+                                picked = Some(c * 3 + i);
+                            }
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(i) = picked {
+            acts.push(Action::Radio(Track::clone(tracks[i])));
+        }
+    });
+}
+
+/// One of Home's recommendation rows (the HomeRecommender port): a song grid with
+/// a header for what it grew from — the seed's cover beside the title, a Show all
+/// onto the artist or genre — and clicking a song starts its radio, as the feed's do.
+/// A row with nowhere to send a Show all (a "Because you like" one) is a handful
+/// of songs rather than a grid's worth: it lays out as big covers, the way Listen
+/// again does.
+fn reco_grid(ui: &mut Ui, rows_ctx: &Rows, liked: &HashSet<String>, acts: &mut Vec<Action>, id: &str, r: &crate::recommend::Row) {
+    let strap = match r.kind {
+        crate::recommend::Kind::BecauseYouLike => "Because you like",
+        crate::recommend::Kind::MoreLike => "More like",
+        crate::recommend::Kind::YourGenre => "Because you listen to",
+        crate::recommend::Kind::NewGenre => "Try something new",
+    };
+    reveal(ui, id, |ui| {
+        let (l, right, show_all) = shelf_header_ext(ui, &r.title, Some(strap), r.thumb.as_deref(), widgets::shelf_overflows(ui, id), r.endpoint.is_some());
+        if show_all {
+            match r.endpoint.as_ref() {
+                Some(crate::recommend::Endpoint::Artist(id)) => acts.push(Action::Go(Page::Artist(id.clone()))),
+                Some(crate::recommend::Endpoint::Mood(params)) => acts.push(Action::Go(Page::Mood(params.clone()))),
+                None => {}
+            }
+        }
+        let tracks: Vec<&Track> = r.tracks.iter().filter(|t| rows_ctx.shows(t)).collect();
+        if tracks.is_empty() {
+            return;
+        }
+        let nudge = right as i32 - l as i32;
+        if r.endpoint.is_none() {
+            // Nothing behind a Show all: the songs are the row's whole worth, and
+            // covers say more than thin rows do at that size.
+            let tile = feed_tile(ui, true);
+            h_scroll(ui, id, nudge, tracks.len(), tile, 20.0, |ui| {
+                ui.spacing_mut().item_spacing.x = 20.0;
+                for t in &tracks {
+                    let is_liked = liked.contains(&t.id);
+                    card(ui, &super::responses::song_card(t), tile, is_liked, None, acts);
+                }
+            });
+            return;
+        }
+        let col_w = feed_tile(ui, false);
+        let mut picked = None;
+        h_scroll(ui, id, nudge, tracks.len().div_ceil(3), col_w, 20.0, |ui| {
+            ui.spacing_mut().item_spacing.x = 20.0;
+            for (c, col) in tracks.chunks(3).enumerate() {
+                ui.allocate_ui(vec2(col_w, 3.0 * 60.0), |ui| {
+                    ui.set_width(col_w);
+                    ui.vertical(|ui| {
+                        for (i, t) in col.iter().enumerate() {
+                            let o = rows_ctx.opts(liked, t, None, false);
+                            if track_row(ui, t, &o, acts).clicked() {
+                                picked = Some(c * 3 + i);
+                            }
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(i) = picked {
+            acts.push(Action::Radio(Track::clone(tracks[i])));
+        }
+    });
 }
 
 // ------------------------------------------------------------------ new
@@ -555,6 +854,17 @@ fn search(app: &mut App, ui: &mut Ui, q: &str, now: f64) {
         app.search_text = q.trim().to_owned();
     }
     super::shell::search_field(app, ui, ui.available_width().min(560.0));
+    // Where the search looks, as on the website: everywhere, or your own music.
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        for (scope, label) in [(crate::ytm::Scope::Everywhere, "YT Music"), (crate::ytm::Scope::Library, "Library"), (crate::ytm::Scope::Uploads, "Uploads")] {
+            if widgets::chip(ui, label, app.search_scope == scope).clicked() && app.search_scope != scope {
+                app.search_scope = scope;
+                app.search = None;
+            }
+        }
+    });
     if q.trim().is_empty() {
         ui.add_space(26.0);
         recent_searches(ui, app);
@@ -596,17 +906,18 @@ fn search(app: &mut App, ui: &mut Ui, q: &str, now: f64) {
     // Top result: the first artist when the query names one, otherwise the first song.
     ui.horizontal_top(|ui| {
         if let Some(top) = r.artists.first().filter(|a| a.title.eq_ignore_ascii_case(q.trim())) {
-            top_result(ui, top, false, acts);
+            top_result(ui, top, false, false, acts);
         } else if let Some(t) = tracks.first().copied() {
             let c = Card {
                 title: t.title.clone(),
-                subtitle: format!("Song • {}", t.artist_line()),
+                subtitle: format!("{} • {}", if t.music_video { "Video" } else { "Song" }, t.artist_line()),
                 thumbs: t.thumbs.clone(),
                 target: Target::Song(t.clone()),
                 round: false,
                 links: t.artists.clone(),
             };
-            top_result(ui, &c, pick, acts);
+            let liked_it = liked.contains(&t.id);
+            top_result(ui, &c, pick, liked_it, acts);
         }
         ui.add_space(24.0);
         ui.vertical(|ui| {
@@ -616,7 +927,8 @@ fn search(app: &mut App, ui: &mut Ui, q: &str, now: f64) {
                 // Its own scope, so a picked-up row dims alone.
                 ui.push_id(i, |ui| {
                     row_drag::grip(ui, drag, ids("songs"), i, t);
-                    let o = RowOpts { pick, ..rows.opts(liked, t, None, false) };
+                    // The album beside the artist, as every other song row shows it.
+                    let o = RowOpts { pick, ..rows.opts(liked, t, None, true) };
                     if track_row(ui, t, &o, acts).clicked() {
                         acts.push(play(t));
                     }
@@ -733,7 +1045,7 @@ fn recent_searches(ui: &mut Ui, app: &mut App) {
 }
 
 /// `pick`: choosing a transfer match, so clicking a song picks it.
-fn top_result(ui: &mut Ui, c: &Card, pick: bool, acts: &mut Vec<Action>) {    ui.vertical(|ui| {
+fn top_result(ui: &mut Ui, c: &Card, pick: bool, liked: bool, acts: &mut Vec<Action>) {    ui.vertical(|ui| {
         ui.label(RichText::new("Top result").font(theme::bold(24.0)));
         ui.add_space(8.0);
         let (rect, resp) = ui.allocate_exact_size(vec2(420.0, 236.0), Sense::click());
@@ -767,6 +1079,8 @@ fn top_result(ui: &mut Ui, c: &Card, pick: bool, acts: &mut Vec<Action>) {    ui
                 t => Action::Open(t.clone()),
             });
         }
+        // Right-click the box for the same menu the tile's ⋮ carries.
+        egui::Popup::context_menu(&resp).show(|ui| widgets::card_menu_contents(ui, c, liked, None, acts));
     });
 }
 
@@ -778,15 +1092,25 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
         return;
     }
     let rows = Rows::new(app, now);
+    // Whether every song of it is on this computer, and how far a download of it is.
+    let downloaded = all_downloaded(app, id);
+    let run = app.download_runs.iter().find(|r| r.key == id).map(|r| (r.done, r.total, r.cancelled));
     // The header's animated cover: the release's first song stands in for the album —
     // Apple files the release's clip with its songs, and the canvas finds it there.
     let px = (232.0 * ui.ctx().pixels_per_point()).round().max(256.0) as u32;
     let proxy = app.opened(id).and_then(|o| o.c.tracks.first().cloned());
     let sprite = proxy.and_then(|t| app.animated_cover(ui.ctx(), &t, px));
     let Some(o) = app.lists.get(id) else { return };
-    let (c, more) = (&o.c, app.receiving(id));
+    let more = app.receiving(id);
+    // Sorted once all of it is here: until then it plays as it arrives.
+    app.sorts.hold(id, more);
+    // A sort of it is under way. None starts while it loads (what's ticked may be stale).
+    let sorting = app.sorting.contains_key(id);
+    let busy = sorting || app.lists.loading(id);
+    let (c, more) = (&o.c, more);
     let acts = &mut app.actions;
     let tracks = &c.tracks;
+    let play_order = super::sorts::list_id(&app.page).and_then(|l| app.sorts.sorted(&l, tracks));
     let is_album = c.is_album;
     let filter_on = app.coll_search.as_ref().is_some_and(|(fid, _)| fid == id);
     let selecting = app.selection.on(&app.page);
@@ -801,6 +1125,7 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
         if let Some(s) = &sprite {
             widgets::paint_motion(ui, img, theme::card_radius() + 2.0, s);
         }
+        widgets::download_veil(ui, img, theme::card_radius() + 2.0, id);
         ui.add_space(26.0);
         ui.vertical(|ui| {
             ui.set_max_width(ui.available_width().min(760.0));
@@ -835,11 +1160,30 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
             let owned = !is_album && c.owned;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = vec2(10.0, 0.0);
-                play_pill(ui, acts, &target, tracks);
+                play_pill(ui, acts, &target, tracks, play_order.as_deref());
                 if circle_action(ui, CircleGlyph::Char(icon::SHUFFLE), "Shuffle", false).clicked() && !tracks.is_empty() {
                     let mut t = tracks.clone();
                     super::shuffle(&mut t);
                     acts.push(Action::Play(t, 0));
+                }
+                if !c.sorts.is_empty() && !more {
+                    saved_sort_pill(ui, &mut app.sorts, id, &c.sorts, busy, sorting, acts);
+                } else if !more {
+                    sort_pill(ui, &mut app.sorts, &app.page, false);
+                }
+                if let Some((.., true)) = run {
+                    // Cancelled: the songs on their way finish first.
+                    pill(ui, "Stopping\u{2026}", None, false);
+                } else if let Some((done, total, _)) = run {
+                    if pill(ui, &format!("Downloading {done} of {total}"), Some(icon::X), false).on_hover_text("Cancel download").clicked() {
+                        acts.push(Action::CancelDownload(id.to_owned()));
+                    }
+                } else if downloaded {
+                    pill(ui, "Downloaded", Some(icon::CHECK), false).on_hover_text(format!("All {} are on this computer", c.things()));
+                } else if !tracks.is_empty() && pill(ui, "Download", Some(icon::DOWNLOAD), false).clicked() {
+                    // A whole list goes as it is; a partial one is fetched in full by the backend.
+                    let complete = !more && !app.lists.loading(id);
+                    acts.push(Action::DownloadMany(Some(target.clone()), c.title.clone(), complete.then(|| tracks.clone())));
                 }
                 if circle_action(ui, CircleGlyph::Char(icon::SEARCH), "Search in this list", filter_on).clicked() {
                     toggle_search = true;
@@ -954,12 +1298,80 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
             .collect()
     };
     let shown: &[Track] = if needle.is_empty() { tracks } else { &filtered };
+    let order = super::sorts::list_id(&app.page).and_then(|l| app.sorts.order(&l, shown));
     let number = |i: usize, t: &Track| is_album.then(|| t.track_nr.map_or(i + 1, |n| n as usize));
     let own = app.logged_in && c.owned && !is_album;
-    list(ui, &rows, &app.liked, shown, !is_album, number, ListCtx { sel: &mut app.selection, page: &app.page, own }, &mut app.row_drag, egui::Id::unique(("list", id)), acts);
+    list(ui, &rows, &app.liked, shown, order.as_deref(), !is_album, number, ListCtx { sel: &mut app.selection, page: &app.page, own }, &mut app.row_drag, egui::Id::unique(("list", id)), acts);
     if more {
         widgets::skeleton_rows(ui, now, 3);
     }
+}
+
+/// Whether every song of a fully loaded album or playlist is downloaded; worked out once
+/// per list (its songs and the downloads folder) and kept until a download changes it.
+fn all_downloaded(app: &mut App, id: &str) -> bool {
+    use std::hash::{Hash, Hasher};
+    let Some(o) = app.lists.get(id) else { return false };
+    // Not while it loads or downloads: its files land one by one, and the run says how far it is.
+    if app.lists.receiving(id) || app.lists.loading(id) || app.download_runs.iter().any(|r| r.key == id) {
+        return false;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    crate::downloads::folder().hash(&mut h);
+    crate::downloads::looks().hash(&mut h);
+    o.c.tracks.iter().for_each(|t| t.id.hash(&mut h));
+    let seen = h.finish();
+    if let Some(&(s, all)) = app.all_downloaded.get(id)
+        && s == seen
+    {
+        return all;
+    }
+    let all = !o.c.tracks.is_empty() && crate::downloads::all_listed(&o.c.tracks);
+    app.all_downloaded.insert(id.to_owned(), (seen, all));
+    all
+}
+
+/// The cover of an album or playlist being downloaded, from its kept copy or its card.
+fn run_thumbs<'a>(app: &'a App, key: &str) -> &'a [crate::model::Thumb] {
+    if let Some(o) = app.opened(key) {
+        return &o.c.thumbs;
+    }
+    let lib = app.library.iter().flat_map(|l| l.playlists.iter().chain(&l.albums));
+    lib.chain(app.sidebar_cache.iter().flatten())
+        .find(|c| matches!(&c.target, Target::Album(id) | Target::Playlist(id) if id == key))
+        .map_or(&[], |c| &c.thumbs)
+}
+
+/// A download of many songs in the Downloads page: its cover (veiled as it goes), its
+/// name, how far it's got, and a button to cancel it. True when cancelled.
+fn download_run(ui: &mut Ui, r: &crate::backend::DownloadRun, thumbs: &[crate::model::Thumb], width: f32) -> bool {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 64.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 10.0, theme::glass(0.04));
+    let img = Rect::from_min_size(rect.min + vec2(10.0, 10.0), Vec2::splat(44.0));
+    if r.title.is_empty() {
+        p.rect_filled(img, theme::thumb_radius(), theme::glass(0.07));
+        widgets::icon_at(ui, img.center(), icon::DOWNLOAD, 20.0, theme::text_dim());
+    } else {
+        paint_cover(ui, img, thumbs, theme::thumb_radius(), 1.0);
+        widgets::download_veil(ui, img, theme::thumb_radius(), &r.key);
+    }
+    let close = Rect::from_center_size(pos2(rect.right() - 26.0, rect.center().y), Vec2::splat(32.0));
+    let x = img.right() + 14.0;
+    let w = close.left() - 14.0 - x;
+    let title = if r.title.is_empty() { "Selected songs" } else { &r.title };
+    widgets::text_at(ui, pos2(x, rect.top() + 11.0), title, theme::semibold(14.0), theme::text(), w);
+    widgets::text_at(ui, pos2(x, rect.top() + 30.0), &if r.cancelled { "Stopping\u{2026}".to_owned() } else { format!("{} of {} songs", r.done, r.total) }, theme::regular(12.5), theme::text_dim(), w);
+    let bar = Rect::from_min_size(pos2(x, rect.bottom() - 12.0), vec2(w, 3.0));
+    let f = theme::anim(ui.ctx(), ("download-run-bar", &r.key), r.done as f32 / r.total.max(1) as f32, 0.4);
+    let accent = ui.ctx().data(|d| d.get_temp::<Color32>(egui::Id::unique("accent"))).unwrap_or(theme::RED);
+    p.rect_filled(bar, 1.5, theme::glass(0.1));
+    p.rect_filled(Rect::from_min_size(bar.min, vec2(w * f, bar.height())), 1.5, accent);
+    if r.cancelled {
+        return false;
+    }
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(close));
+    widgets::icon_button(&mut child, icon::X, 16.0, "Cancel download", false).clicked()
 }
 
 // ------------------------------------------------------------------ artist
@@ -971,6 +1383,7 @@ fn artist(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
     }
     let rows = Rows::new(app, now);
     let accent = app.accent_color();
+    let subscribing = app.subscriptions.busy();
     let name = app.artist.as_ref().map(|a| a.name.clone()).unwrap_or_default();
     // The listener's signature service stands in for the name where it has one.
     let signature = app.signature_texture(ui.ctx(), &name);
@@ -994,7 +1407,10 @@ fn artist(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
     } else {
         ui.painter().rect_filled(hero, 14.0, theme::with_alpha(accent, 0.25));
     }
-    super::shell::vgradient(ui.painter(), Rect::from_min_max(pos2(hero.left(), hero.center().y - 40.0), hero.max), Color32::TRANSPARENT, theme::shade(0.85));
+    // The banner melts into the page on every side — a header wash, not a photograph
+    // pasted over it — and the name sits in the foot ramp's dark, where the old shade
+    // used to cut the image off hard.
+    widgets::melt_edges(ui, hero, theme::bg(), 110.0, 64.0, hero_h * 0.55);
     let base = hero.left_bottom() + vec2(28.0, -30.0);
     match &signature {
         // The artist's own hand, credited above it the way a page signs itself off.
@@ -1019,9 +1435,11 @@ fn artist(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
         ui.painter().text(base - vec2(0.0, 18.0), Align2::LEFT_BOTTOM, format!("{} subscribers", compact(s)), theme::regular(14.0), theme::text_dim());
     }
     ui.add_space(18.0);
+    // An artist of your uploads: all your songs by them, as on the website.
+    let uploaded = crate::ytm::uploaded(id);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
-        play_pill(ui, acts, &Target::Artist(id.to_owned()), top);
+        play_pill(ui, acts, &Target::Artist(id.to_owned()), top, None);
         if pill(ui, "Shuffle", Some(icon::SHUFFLE), false).clicked() && !top.is_empty() {
             let mut t = top.clone();
             super::shuffle(&mut t);
@@ -1031,11 +1449,17 @@ fn artist(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
             && pill(ui, "Radio", Some(icon::RADIO), false).clicked() {
                 acts.push(Action::Radio(first.clone()));
             }
+        // Greyed out while a subscribe or unsubscribe runs: a click then wouldn't count.
+        if a.channel_id.is_some()
+            && ui.add_enabled_ui(!subscribing, |ui| pill(ui, if a.subscribed { "Subscribed" } else { "Subscribe" }, None, false)).inner.clicked()
+        {
+            acts.push(Action::Subscribe(!a.subscribed));
+        }
     });
     if !top.is_empty() {
         ui.add_space(26.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Top songs").font(theme::bold(24.0)).color(theme::text()));
+            ui.label(RichText::new(if uploaded { "Songs" } else { "Top songs" }).font(theme::bold(24.0)).color(theme::text()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // With a "Top songs" playlist behind the shelf, Show all opens it; without
                 // one, the shelf page stands in and lists everything the page holds.
@@ -1051,7 +1475,7 @@ fn artist(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
         // They can be dragged onto a playlist in the sidebar.
         let drag = &mut app.row_drag;
         let list = egui::Id::unique(("artist-top", id));
-        for (i, t) in top.iter().enumerate().take(5) {
+        for (i, t) in top.iter().enumerate().take(if uploaded { top.len() } else { 5 }) {
             // Its own scope, so a picked-up row dims alone.
             ui.push_id(i, |ui| {
                 row_drag::grip(ui, drag, list, i, t);
@@ -1067,6 +1491,11 @@ fn artist(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
     // artist's full discography for that kind of release.
     card_row_all(ui, "a-albums", "Albums", &a.albums, a.albums_more.is_some(), acts, || Action::Go(Page::ArtistShelf { artist: id.to_owned(), title: "Albums".to_owned() }));
     card_row_all(ui, "a-singles", "Singles", &a.singles, a.singles_more.is_some(), acts, || Action::Go(Page::ArtistShelf { artist: id.to_owned(), title: super::SINGLES_SHELF.to_owned() }));
+    // Their songs you've saved, less those hidden as explicit.
+    let library: Vec<Card> = a.library.iter().filter(|c| !matches!(&c.target, Target::Song(t) if !rows.shows(t))).cloned().collect();
+    if !library.is_empty() {
+        card_row(ui, "a-lib", "From your library", &library, acts);
+    }
     card_row(ui, "a-pl", "Featured on", &a.playlists, acts);
     card_row(ui, "a-sim", "Fans might also like", &a.similar, acts);
     if let Some(d) = a.description.as_deref().filter(|d| !d.trim().is_empty()) {
@@ -1129,14 +1558,14 @@ fn artist_shelf(app: &mut App, ui: &mut Ui, artist: &str, title: &str, now: f64)
         let mut sel = std::mem::take(&mut app.selection);
         let page = app.page.clone();
         let cx = ListCtx { sel: &mut sel, page: &page, own: false };
-        let clicked = list(ui, &rows, liked, tracks, true, plain, cx, &mut app.row_drag, egui::Id::unique(("shelf", app.page.clone())), acts);
+        let clicked = list(ui, &rows, liked, tracks, None, true, plain, cx, &mut app.row_drag, egui::Id::unique(("shelf", app.page.clone())), acts);
         app.selection = sel;
         let _ = clicked;
     } else if !s.cards.is_empty() {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(20.0, 22.0);
             for c in &s.cards {
-                card(ui, c, CARD, false, acts);
+                card(ui, c, CARD, false, None, acts);
             }
         });
     }
@@ -1150,7 +1579,9 @@ fn artist_shelf(app: &mut App, ui: &mut Ui, artist: &str, title: &str, now: f64)
 
 fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
     page_title(ui, "Library");
-    if !app.logged_in {
+    // The Uploads tab holds this computer's songs too, below the account's: it opens
+    // signed out, with its upload half asking for a sign-in.
+    if !app.logged_in && tab != LibTab::Uploads {
         ui.add_space(10.0);
         ui.label(RichText::new("Sign in to see your playlists, liked songs and history.").color(theme::text_dim()));
         ui.add_space(12.0);
@@ -1163,7 +1594,7 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         let podcasts = app.show_podcasts;
-        for (t, label) in [(LibTab::Playlists, "Playlists"), (LibTab::Songs, "Liked songs"), (LibTab::Albums, "Albums"), (LibTab::Podcasts, "Podcasts"), (LibTab::History, "History"), (LibTab::Uploads, "Uploads")].into_iter().filter(|(t, _)| podcasts || *t != LibTab::Podcasts) {
+        for (t, label) in [(LibTab::Playlists, "Playlists"), (LibTab::Songs, "Liked songs"), (LibTab::Albums, "Albums"), (LibTab::Artists, "Artists"), (LibTab::Podcasts, "Podcasts"), (LibTab::History, "History"), (LibTab::Uploads, "Uploads")].into_iter().filter(|(t, _)| podcasts || *t != LibTab::Podcasts) {
             if chip(ui, label, tab == t).clicked() {
                 // Tabs swap in place (no history entry); the current one refreshes.
                 if tab == t {
@@ -1176,11 +1607,13 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
         }
     });
     ui.add_space(12.0);
-    let grid = |ui: &mut Ui, cards: &[Card], acts: &mut Vec<Action>| {
+    // `pinned`: on Library › Playlists, where playlists are pinned.
+    let grid = |ui: &mut Ui, cards: &[Card], order: &[usize], pinned: Option<&[String]>, acts: &mut Vec<Action>| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(20.0, 22.0);
-            for c in cards {
-                card(ui, c, CARD, false, acts);
+            for &i in order {
+                let pin = pinned.map(|p| matches!(&cards[i].target, Target::Playlist(id) if p.contains(id)));
+                card(ui, &cards[i], CARD, false, pin, acts);
             }
         });
     };
@@ -1193,33 +1626,14 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
                 return;
             }
             let Some(h) = &app.history else { return };
-            list(ui, &rows, &app.liked, h, true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.row_drag, egui::Id::unique("history"), &mut app.actions);
-        }
-        LibTab::Uploads => {
             ui.horizontal(|ui| {
-                if pill(ui, "Upload music", Some(icon::UPLOAD), true).clicked() {
-                    app.pick_uploads(ui.ctx());
-                }
-                if app.uploads.as_ref().is_some_and(|u| !u.is_empty()) && pill(ui, "Shuffle", Some(icon::SHUFFLE), false).clicked() {
-                    let mut t = app.uploads.clone().unwrap_or_default();
-                    super::shuffle(&mut t);
-                    app.actions.push(Action::Play(t, 0));
-                }
+                sort_pill(ui, &mut app.sorts, &app.page, false);
             });
-            ui.add_space(6.0);
-            ui.label(RichText::new("Or drop audio files anywhere on the window. MP3, M4A, FLAC, OGG and WMA.").font(theme::regular(13.0)).color(theme::text_dim()));
-            ui.add_space(12.0);
-            if app.uploads.is_none() {
-                placeholder(app, ui, now, 1, 48.0);
-                return;
-            }
-            let Some(up) = &app.uploads else { return };
-            if up.is_empty() {
-                ui.add_space(20.0);
-                ui.label(RichText::new("No uploads yet").color(theme::text_dim()));
-            }
-            list(ui, &rows, &app.liked, up, true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.row_drag, egui::Id::unique("uploads"), &mut app.actions);
+            ui.add_space(10.0);
+            let order = app.sorts.order("history", h);
+            list(ui, &rows, &app.liked, h, order.as_deref(), true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.row_drag, egui::Id::unique("history"), &mut app.actions);
         }
+        LibTab::Uploads => uploads_tab(app, ui, now, &rows),
         // Liked Music, kept like any playlist.
         LibTab::Songs => {
             if app.opened(super::LIKED_MUSIC).is_none() {
@@ -1232,7 +1646,12 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
             if !liked.is_empty() {
                 ui.horizontal(|ui| {
                     if pill(ui, "Play", Some(icon::PLAY), true).clicked() {
-                        app.actions.push(Action::Play(liked.clone(), 0));
+                        // All of it from the top, in the order it's sorted.
+                        let plays = match app.sorts.sorted(super::LIKED_MUSIC, liked) {
+                            Some(o) => o.iter().map(|&i| liked[i].clone()).collect(),
+                            None => liked.clone(),
+                        };
+                        app.actions.push(Action::Play(plays, 0));
                     }
                     if pill(ui, "Shuffle", Some(icon::SHUFFLE), false).clicked() {
                         let mut t = liked.clone();
@@ -1240,10 +1659,12 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
                         app.actions.push(Action::Play(t, 0));
                     }
                     select_pill(ui, &mut app.selection, &app.page);
+                    sort_pill(ui, &mut app.sorts, &app.page, more);
                 });
                 ui.add_space(10.0);
             }
-            list(ui, &rows, &app.liked, liked, true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.row_drag, egui::Id::unique("liked"), &mut app.actions);
+            let order = app.sorts.order(super::LIKED_MUSIC, liked);
+            list(ui, &rows, &app.liked, liked, order.as_deref(), true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.row_drag, egui::Id::unique("liked"), &mut app.actions);
             if more {
                 widgets::skeleton_rows(ui, now, 3);
             }
@@ -1254,16 +1675,25 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
                 return;
             }
             let Some(lib) = &app.library else { return };
+            if matches!(tab, LibTab::Playlists | LibTab::Albums | LibTab::Artists | LibTab::Podcasts) {
+                ui.horizontal(|ui| {
+                    sort_pill(ui, &mut app.sorts, &app.page, false);
+                });
+                ui.add_space(10.0);
+            }
             match tab {
                 LibTab::Playlists => {
                     if pill(ui, "New playlist", None, false).clicked() {
                         app.actions.push(Action::NewPlaylist(Vec::new()));
                     }
                     ui.add_space(14.0);
-                    grid(ui, &lib.playlists, &mut app.actions)
+                    let pinned = app.pinned.as_slice();
+                    let order = super::collections::pinned_first(pinned, &lib.playlists, app.sorts.cards("playlists", &lib.playlists));
+                    grid(ui, &lib.playlists, &order, Some(pinned), &mut app.actions)
                 }
-                LibTab::Albums => grid(ui, &lib.albums, &mut app.actions),
-                LibTab::Podcasts => grid(ui, &lib.podcasts, &mut app.actions),
+                LibTab::Albums => grid(ui, &lib.albums, &app.sorts.cards("albums", &lib.albums), None, &mut app.actions),
+                LibTab::Artists => grid(ui, &lib.artists, &app.sorts.cards("artists", &lib.artists), None, &mut app.actions),
+                LibTab::Podcasts => grid(ui, &lib.podcasts, &app.sorts.cards("podcasts", &lib.podcasts), None, &mut app.actions),
                 LibTab::Songs | LibTab::History | LibTab::Uploads => unreachable!(),
             }
         }
@@ -1272,21 +1702,122 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
 
 // ------------------------------------------------------------------ downloads
 
+/// Library › Uploads: two ways to have songs of your own. Uploading puts them in the
+/// account's cloud library — playable on any device, but YouTube Music converts what it
+/// takes, so a FLAC doesn't stay lossless. Local music plays straight from this
+/// computer, each file as it is.
+fn uploads_tab(app: &mut App, ui: &mut Ui, now: f64, rows: &Rows) {
+    let plain = |_: usize, _: &Track| None;
+    ui.label(RichText::new("Upload to YouTube Music").font(theme::bold(15.0)).color(theme::text()));
+    ui.add_space(4.0);
+    ui.label(RichText::new("Songs go into the account's cloud library, playable on any device. YouTube Music converts what it takes — MP3, M4A, FLAC, OGG and WMA — so a FLAC doesn't stay lossless.").font(theme::regular(13.0)).color(theme::text_dim()));
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        if pill(ui, "Upload to YouTube Music", Some(icon::UPLOAD), true).clicked() {
+            app.pick_uploads(ui.ctx());
+        }
+        if app.uploads.as_ref().is_some_and(|u| !u.is_empty()) && pill(ui, "Shuffle", Some(icon::SHUFFLE), false).clicked() {
+            let mut t = app.uploads.clone().unwrap_or_default();
+            super::shuffle(&mut t);
+            app.actions.push(Action::Play(t, 0));
+        }
+    });
+    ui.add_space(12.0);
+    if !app.logged_in {
+        ui.label(RichText::new("Sign in to upload. Local music below works without an account.").font(theme::regular(13.0)).color(theme::text_dim()));
+    } else if app.uploads.is_none() {
+        placeholder(app, ui, now, 1, 48.0);
+    } else if let Some(up) = &app.uploads {
+        if up.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new("No uploads yet").color(theme::text_dim()));
+        } else {
+            ui.horizontal(|ui| {
+                sort_pill(ui, &mut app.sorts, &app.page, false);
+            });
+            ui.add_space(10.0);
+        }
+        let order = app.sorts.order("uploads", up);
+        list(ui, rows, &app.liked, up, order.as_deref(), true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.row_drag, egui::Id::unique("uploads"), &mut app.actions);
+    }
+    ui.add_space(30.0);
+    ui.label(RichText::new("Local music").font(theme::bold(15.0)).color(theme::text()));
+    ui.add_space(4.0);
+    ui.label(RichText::new("Songs from this computer, played straight from their files: nothing is uploaded, and a FLAC plays as the FLAC it is. Add files or a folder, or drop them anywhere on the window.").font(theme::regular(13.0)).color(theme::text_dim()));
+    ui.add_space(10.0);
+    let empty = app.local.is_empty();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        if pill(ui, "Add music", Some(icon::MUSIC), false).clicked() {
+            app.pick_local(ui.ctx());
+        }
+        if pill(ui, "Add folder", Some(icon::FOLDER_OPEN), false).clicked() {
+            app.pick_local_folder(ui.ctx());
+        }
+        if !empty {
+            if pill(ui, "Play", Some(icon::PLAY), true).clicked() {
+                // All of them from the top, in the order it's sorted.
+                let plays = match app.sorts.sorted("local", &app.local) {
+                    Some(o) => o.iter().map(|&i| app.local[i].clone()).collect(),
+                    None => app.local.clone(),
+                };
+                app.actions.push(Action::Play(plays, 0));
+            }
+            if pill(ui, "Shuffle", Some(icon::SHUFFLE), false).clicked() {
+                let mut t = app.local.clone();
+                super::shuffle(&mut t);
+                app.actions.push(Action::Play(t, 0));
+            }
+            sort_pill_list(ui, &mut app.sorts, &app.page, "local", false);
+        }
+    });
+    ui.add_space(12.0);
+    if empty {
+        ui.label(RichText::new("No local music yet").color(theme::text_dim()));
+        return;
+    }
+    let order = app.sorts.order("local", &app.local);
+    // Its rows pick nothing: the Select bar belongs to the uploads above, whose rows
+    // are a different list.
+    let mut no_sel = Selection::default();
+    list(ui, rows, &app.liked, &app.local, order.as_deref(), true, plain, ListCtx { sel: &mut no_sel, page: &app.page, own: false }, &mut app.row_drag, egui::Id::unique("local"), &mut app.actions);
+}
+
 fn downloads(app: &mut App, ui: &mut Ui, now: f64) {
     page_title(ui, "Downloads");
-    let songs = crate::downloads::list();
+    let Some(songs) = &app.downloads else { return };
     ui.add_space(4.0);
     ui.label(
         RichText::new(format!("{} songs \u{2022} {}", songs.len(), crate::downloads::folder().display()))
             .font(theme::regular(13.0))
             .color(theme::text_dim()),
     );
+    // Runs side by side, as many to a line as fit at 280 wide or more.
+    let mut cancel = None;
+    let (gap, full) = (8.0, ui.available_width());
+    let cols = (((full + gap) / (280.0 + gap)).floor() as usize).max(1);
+    let w = (full - gap * (cols - 1) as f32) / cols as f32;
+    for line in app.download_runs.chunks(cols) {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for r in line {
+                if download_run(ui, r, run_thumbs(app, &r.key), w) {
+                    cancel = Some(r.key.clone());
+                }
+            }
+        });
+    }
+    if let Some(key) = cancel {
+        app.actions.push(Action::CancelDownload(key));
+    }
     ui.add_space(12.0);
     if songs.is_empty() {
         ui.label(RichText::new("No downloads yet").font(theme::semibold(16.0)).color(theme::text()));
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Right-click a song and choose Download to keep it on this computer, playable offline.")
+            RichText::new("Right-click a song and choose Download, or a whole album or playlist from its page, to keep it on this computer, playable offline.")
                 .font(theme::regular(13.0))
                 .color(theme::text_dim()),
         );
@@ -1298,7 +1829,12 @@ fn downloads(app: &mut App, ui: &mut Ui, now: f64) {
     }
     ui.horizontal(|ui| {
         if pill(ui, "Play", Some(icon::PLAY), true).clicked() {
-            app.actions.push(Action::Play(songs.clone(), 0));
+            // All of them from the top, in the order they're sorted.
+            let plays = match app.sorts.sorted("downloads", songs) {
+                Some(o) => o.iter().map(|&i| songs[i].clone()).collect(),
+                None => songs.clone(),
+            };
+            app.actions.push(Action::Play(plays, 0));
         }
         if pill(ui, "Shuffle", Some(icon::SHUFFLE), false).clicked() {
             let mut t = songs.clone();
@@ -1308,10 +1844,12 @@ fn downloads(app: &mut App, ui: &mut Ui, now: f64) {
         if pill(ui, "Open folder", Some(icon::FOLDER_OPEN), false).clicked() {
             crate::downloads::open_folder();
         }
+        sort_pill(ui, &mut app.sorts, &app.page, false);
     });
     ui.add_space(12.0);
     let rows = Rows::new(app, now);
-    list(ui, &rows, &app.liked, &songs, true, |_, _| None, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.row_drag, egui::Id::unique("downloads"), &mut app.actions);
+    let order = app.sorts.order("downloads", songs);
+    list(ui, &rows, &app.liked, songs, order.as_deref(), true, |_, _| None, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.row_drag, egui::Id::unique("downloads"), &mut app.actions);
 }
 
 // ------------------------------------------------------------------ settings
@@ -1323,6 +1861,7 @@ fn downloads(app: &mut App, ui: &mut Ui, now: f64) {
 pub(super) enum SettingsTab {
     #[default]
     Account,
+    Discord,
     Playback,
     Sources,
     Lyrics,
@@ -1332,11 +1871,12 @@ pub(super) enum SettingsTab {
 }
 
 impl SettingsTab {
-    const ALL: [Self; 7] = [Self::Account, Self::Playback, Self::Sources, Self::Lyrics, Self::Appearance, Self::General, Self::Shortcuts];
+    const ALL: [Self; 8] = [Self::Account, Self::Discord, Self::Playback, Self::Sources, Self::Lyrics, Self::Appearance, Self::General, Self::Shortcuts];
 
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Account => "Account",
+            Self::Discord => "Discord",
             Self::Playback => "Playback",
             Self::Sources => "Music sources",
             Self::Lyrics => "Lyrics",
@@ -1370,7 +1910,7 @@ fn words_match(words: &[String], section: &str, text: &str) -> bool {
     words.iter().all(|w| section.contains(w.as_str()) || text.contains(w.as_str()))
 }
 
-fn filtering() -> bool {
+pub(super) fn filtering() -> bool {
     FILTER.with_borrow(|f| !f.words.is_empty())
 }
 
@@ -1485,10 +2025,10 @@ fn settings_tab(app: &mut App, ui: &mut Ui, tab: SettingsTab) {
                 super::transfer::settings_section(app, ui);
             }
         }
+        SettingsTab::Discord => super::presence::settings(app, ui),
         SettingsTab::Playback => settings_playback(app, ui),
         SettingsTab::Sources => {
             settings_sources(app, ui);
-            settings_saavn(app, ui);
         }
         SettingsTab::Lyrics => {
             settings_lyrics(app, ui);
@@ -1498,10 +2038,13 @@ fn settings_tab(app: &mut App, ui: &mut Ui, tab: SettingsTab) {
             settings_artists(app, ui);
         }
         SettingsTab::General => {
+            settings_community(ui);
             settings_window(app, ui);
             settings_downloads(ui);
             settings_updates(app, ui);
             settings_section(ui, "Network", None, None, |ui| network(app, ui));
+            // Last, as most apps keep it.
+            super::storage::settings_section(app, ui);
         }
         SettingsTab::Shortcuts => {
             if filter_show(ui, "Keyboard shortcuts keys hotkeys shortcuts combo") {
@@ -1619,6 +2162,12 @@ fn settings_account(app: &mut App, ui: &mut Ui) {
                 }
             });
         }
+        divider(ui);
+        // Listen together, under the account it borrows its name from: the page holds
+        // both room kinds, the relay jam and the web app's Listen Together.
+        if open_row(ui, "Listen together", &format!("Play the same music at the same moment, on up to {} devices.", crate::jam::DEFAULT_MEMBERS)) {
+            app.go(Page::Jam);
+        }
     });
     if busy && filter_show(ui, "finish signing in in the window that opened") {
         ui.add_space(6.0);
@@ -1628,6 +2177,7 @@ fn settings_account(app: &mut App, ui: &mut Ui) {
         app.start_sign_in(ui.ctx());
     }
     if sign_out {
+        app.settle_now();
         app.backend.request(crate::backend::Req::Logout);
     }
 }
@@ -1670,7 +2220,9 @@ fn channel_picker(app: &mut App, ui: &mut Ui) {
     });
     if let Some(c) = pick.filter(|c| c.page_id != *current && !switching) {
         app.switching_to = Some(label(&c));
-        app.backend.request(crate::backend::Req::SwitchChannel { page_id: c.page_id, epoch: *epoch });
+        let epoch = *epoch;
+        app.settle_now();
+        app.backend.request(crate::backend::Req::SwitchChannel { page_id: c.page_id, epoch });
     }
 }
 
@@ -1681,10 +2233,23 @@ fn settings_playback(app: &mut App, ui: &mut Ui) {
             toggle(ui, &mut app.autoplay, "Autoplay");
         });
         divider(ui);
-        setting_row(ui, "Volume normalization", Some("Turn loud songs down to the same level, like YouTube Music does."), |ui| {
-            if toggle(ui, &mut app.normalize, "Volume normalization").changed() {
-                app.audio.set_normalize(app.normalize);
-            }
+        let desc = normalization_desc(app);
+        setting_row(ui, "Volume normalization", Some(&desc), |ui| {
+            use crate::audio::Normalize;
+            let btn = dropdown_button(ui, app.normalize.label(), 120.0, "Volume normalization");
+            egui::Popup::menu(&btn).show(|ui| {
+                ui.set_width(120.0);
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                ui.add_space(4.0);
+                for level in Normalize::ALL {
+                    if option_row(ui, level.label(), level == app.normalize).clicked() {
+                        app.normalize = level;
+                        app.audio.set_normalize(level);
+                        ui.close();
+                    }
+                }
+                ui.add_space(4.0);
+            });
         });
         divider(ui);
         setting_row(ui, "Logarithmic volume", Some("Space the volume slider out the way ears hear loudness, so quiet levels aren't squeezed into its first few pixels."), |ui| {
@@ -1701,7 +2266,7 @@ fn settings_playback(app: &mut App, ui: &mut Ui) {
             output_device_picker(app, ui);
         });
         divider(ui);
-        setting_row(ui, "Show music videos", Some("Music videos play as moving video, with their own sound and no lyrics. The Song and Video switch in Now playing swaps between them either way."), |ui| {
+        setting_row(ui, "Show music videos", Some("Music videos play as moving video, with their own sound and no lyrics. Turned off while songs play in their place, songs have no Song and Video switch in Now playing; music videos keep theirs."), |ui| {
             let mut on = app.show_video;
             if toggle(ui, &mut on, "Show music videos").changed() {
                 app.actions.push(Action::ToggleVideo);
@@ -1717,17 +2282,11 @@ fn settings_playback(app: &mut App, ui: &mut Ui) {
                 ui.add_space(4.0);
                 for h in super::VIDEO_QUALITIES {
                     if option_row(ui, &label(h), h == app.video_quality).clicked() {
-                        // Nothing to switch over: a video only plays in Now playing, which
-                        // covers this page. The next one asks for the new quality.
-                        app.video_quality = h;
+                        super::nowplaying::set_video_quality(app, h);
                         ui.close();
                     }
                 }
             });
-        });
-        divider(ui);
-        setting_row(ui, "Ambient light", Some("Now playing glows with the video's colours around it."), |ui| {
-            toggle(ui, &mut app.ambient_light, "Ambient light");
         });
         divider(ui);
         setting_row(ui, "Hide videos in search", Some("Only songs, albums, artists and playlists in search results."), |ui| {
@@ -2012,6 +2571,23 @@ fn bitchord_addons_editor(app: &mut App, ui: &mut Ui) {
         edited = true;
     }
     if edited {
+        // One row per distinct link: an exact repeat of one already listed is dropped
+        // (it would fire duplicate searches and streams at one server, which is how a
+        // working source starts answering 502). A different link on the same host is a
+        // separate source the user asked for and stays.
+        let mut seen = std::collections::HashSet::new();
+        let mut i = 0;
+        while i < app.hires_sources.len() {
+            let key = app.hires_sources[i].trim().to_owned();
+            if !key.is_empty() && !seen.insert(key) {
+                app.hires_sources.remove(i);
+                if i < app.hires_enabled.len() {
+                    app.hires_enabled.remove(i);
+                }
+            } else {
+                i += 1;
+            }
+        }
         app.backend.set_hires_source(&live_sources(app));
     }
     if app.hires_adding {
@@ -2031,7 +2607,9 @@ fn bitchord_addons_editor(app: &mut App, ui: &mut Ui) {
                 }
             });
             hires_test_line(app, ui, &typed);
-            if resp.lost_focus() {
+            // Enter commits without needing to click away; clicking elsewhere does too.
+            let enter = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if resp.lost_focus() || enter {
                 let link = app.hires_draft.trim().to_owned();
                 if !link.is_empty() && !app.hires_sources.iter().any(|s| s.trim() == link) {
                     app.hires_sources.push(link);
@@ -2100,8 +2678,28 @@ fn live_sources(app: &App) -> String {
 
 /// Settings › Music sources: the providers ported from Mochy-Music. When one has the
 /// song, its copy plays instead of YouTube's, and its quality shows in the player.
+/// The page reads one way: how a song plays, then the sources in the order they're
+/// asked — each with its own settings under its row, like every other — then the
+/// servers themselves.
 fn settings_sources(app: &mut App, ui: &mut Ui) {
-    settings_section(ui, "Source priority", None, Some("Other catalogs that can stand in for YouTube's stream when they have the song: the first source in the priority list that holds the song plays its own copy, and when none does, YouTube plays as usual."), |ui| {
+    settings_section(ui, "How songs play", None, Some("Every source on this page plays by these, whichever one a song comes from."), |ui| {
+        setting_row(ui, "Prefer Dolby Atmos", Some("Ask the addons for a Dolby Atmos copy when they offer one. Falls back to the best stereo copy when the stream's codec can't be decoded."), |ui| {
+            if toggle(ui, &mut app.prefer_atmos, "Prefer Dolby Atmos").changed() {
+                app.backend.set_prefer_atmos(app.prefer_atmos);
+            }
+        });
+        divider(ui);
+        setting_row(ui, "Play YouTube first, upgrade after", Some("Start every song from YouTube at once and swap in the hi-res copy in place when an addon answers, instead of waiting for the addons before the song starts."), |ui| {
+            if toggle(ui, &mut app.disable_direct_stream, "Play YouTube first, upgrade after").changed() {
+                app.backend.set_disable_direct_stream(app.disable_direct_stream);
+            }
+        });
+        divider(ui);
+        setting_row(ui, "Stats for nerds", Some("Show the codec, sample rate and bitrate of what's playing at the foot of the cover in Now playing, whatever the source."), |ui| {
+            toggle(ui, &mut app.show_nerd_stats, "Stats for nerds");
+        });
+    });
+    settings_section(ui, "Source priority", None, Some("The first source in this list that has the song plays its own copy; when none does, YouTube Music plays as usual. The arrows beside a source's switch move it up and down."), |ui| {
         for i in 0..app.source_order.len() {
             let kind = app.source_order[i];
             if i > 0 {
@@ -2142,10 +2740,69 @@ fn settings_sources(app: &mut App, ui: &mut Ui) {
                     }
                 });
             });
+            // The built-in streamer's check, under its own row: its own unit in a search.
+            if kind == crate::backend::MusicSource::Monochrome && filter_show(ui, "Monochrome test connection") {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let slot = app.monochrome_test.clone();
+                    let state = slot.lock().unwrap().clone();
+                    if matches!(state, Some(None)) {
+                        ui.add_space(ui.available_width().min(76.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spinner();
+                        });
+                    } else if pill(ui, "Test", None, false).clicked() {
+                        *slot.lock().unwrap() = Some(None);
+                        let (slot, http) = (slot, app.backend.http());
+                        app.backend.spawn(async move {
+                            let (good, msg) = crate::providers::probe_monochrome(&http, crate::providers::MONO_STREAMER).await;
+                            *slot.lock().unwrap() = Some(Some((good, msg)));
+                        });
+                    }
+                });
+                test_line(ui, &app.monochrome_test.lock().unwrap().clone());
+                ui.add_space(10.0);
+            }
+            // JioSaavn's own settings, under its row the same way: its stream quality and
+            // its check, one unit in a search. Which quality plays is the row's say above.
+            if kind == crate::backend::MusicSource::JioSaavn && filter_show(ui, "JioSaavn stream quality test connection") {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let btn = dropdown_button(ui, app.jiosaavn_quality.label(), 200.0, "JioSaavn stream");
+                    egui::Popup::menu(&btn).show(|ui| {
+                        ui.set_width(200.0);
+                        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                        ui.add_space(4.0);
+                        for quality in crate::providers::SaavnQuality::ALL {
+                            if option_row(ui, quality.label(), app.jiosaavn_quality == quality).clicked() {
+                                app.jiosaavn_quality = quality;
+                                app.backend.set_saavn_quality(quality);
+                                ui.close();
+                            }
+                        }
+                        ui.add_space(4.0);
+                    });
+                    let slot = app.saavn_test.clone();
+                    let state = slot.lock().unwrap().clone();
+                    if matches!(state, Some(None)) {
+                        ui.spinner();
+                    } else if pill(ui, "Test", None, false).clicked() {
+                        *slot.lock().unwrap() = Some(None);
+                        let (slot, http) = (slot, app.backend.http());
+                        app.backend.spawn(async move {
+                            let (good, msg) = crate::providers::probe_saavn(&http).await;
+                            *slot.lock().unwrap() = Some(Some((good, msg)));
+                        });
+                    }
+                });
+                test_line(ui, &app.saavn_test.lock().unwrap().clone());
+                ui.add_space(10.0);
+            }
         }
     });
-    settings_sources_lists(app, ui);
     settings_provider_add(app, ui);
+    settings_sources_lists(app, ui);
 }
 
 /// One source's row: what it is and what turning it off means.
@@ -2288,59 +2945,8 @@ fn settings_sources_lists(app: &mut App, ui: &mut Ui) {
     settings_section(ui, "Bitchord addons", None, Some("Addon servers that serve hi-res copies of songs. A switched-off addon keeps its place in the list, but no song is looked up on it."), |ui| {
         bitchord_addons_editor(app, ui);
     });
-    settings_section(ui, "Monochrome servers", None, Some("Monochrome-format servers you've added, tried before Monochrome's own streamer — they were added for a reason. A site's link is read for the server it plays from. New servers come from \"Add a custom provider\" below, which asks both formats at once."), |ui| {
+    settings_section(ui, "Monochrome servers", None, Some("Monochrome-format servers you've added, tried before Monochrome's own streamer — they were added for a reason. A site's link is read for the server it plays from. New servers come from \"Add a custom provider\" above, which asks both formats at once."), |ui| {
         mono_servers_editor(app, ui);
-    });
-}
-
-/// JioSaavn's stream quality, its Test, and the addons' Dolby Atmos switch.
-fn settings_saavn(app: &mut App, ui: &mut Ui) {
-    settings_section(ui, "Streams", None, None, |ui| {
-        setting_row(ui, "JioSaavn stream", Some("How much data a JioSaavn copy uses. 320 is its best; songs that don't have it play 160."), |ui| {
-            let btn = dropdown_button(ui, app.jiosaavn_quality.label(), 200.0, "JioSaavn stream");
-            egui::Popup::menu(&btn).show(|ui| {
-                ui.set_width(200.0);
-                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                ui.add_space(4.0);
-                for quality in crate::providers::SaavnQuality::ALL {
-                    if option_row(ui, quality.label(), app.jiosaavn_quality == quality).clicked() {
-                        app.jiosaavn_quality = quality;
-                        app.backend.set_saavn_quality(quality);
-                        ui.close();
-                    }
-                }
-            });
-        });
-        divider(ui);
-        // JioSaavn's own check is its own unit: searching "test" finds it alone.
-        if filter_show(ui, "JioSaavn test connection") {
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let slot = app.saavn_test.clone();
-                let state = slot.lock().unwrap().clone();
-                if matches!(state, Some(None)) {
-                    ui.add_space(ui.available_width().min(76.0));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spinner();
-                    });
-                } else if pill(ui, "Test", None, false).clicked() {
-                    *slot.lock().unwrap() = Some(None);
-                    let (slot, http) = (slot, app.backend.http());
-                    app.backend.spawn(async move {
-                        let (good, msg) = crate::providers::probe_saavn(&http).await;
-                        *slot.lock().unwrap() = Some(Some((good, msg)));
-                    });
-                }
-            });
-            test_line(ui, &app.saavn_test.lock().unwrap().clone());
-            ui.add_space(10.0);
-        }
-        divider(ui);
-        setting_row(ui, "Prefer Dolby Atmos", Some("Ask the addons for a Dolby Atmos copy when they offer one. Falls back to the best stereo copy when the stream's codec can't be decoded."), |ui| {
-            if toggle(ui, &mut app.prefer_atmos, "Prefer Dolby Atmos").changed() {
-                app.backend.set_prefer_atmos(app.prefer_atmos);
-            }
-        });
     });
 }
 
@@ -2476,7 +3082,7 @@ fn settings_updates(app: &mut App, ui: &mut Ui) {
 
 /// Settings › Downloads.
 fn settings_downloads(ui: &mut Ui) {
-    settings_section(ui, "Downloads", None, Some("Download songs from their menu. They're saved at the best quality your account gets, tagged with their cover art, and play from the file, even offline."), |ui| {
+    settings_section(ui, "Downloads", None, Some("Download songs from their menu, or whole albums and playlists from their page. They're saved at the best quality your account gets, tagged with their cover art, and play from the file, even offline."), |ui| {
         let folder = crate::downloads::folder().display().to_string();
         setting_row(ui, "Download folder", Some(&folder), |ui| {
             if pill(ui, "Change", None, false).clicked() {
@@ -2538,25 +3144,12 @@ fn settings_lyrics(app: &mut App, ui: &mut Ui) {
             }
         });
         divider(ui);
-        // Intensive glow: the sung words' drop-shadow lit much harder than the look
-        // asks, with the listener's own strength on top.
-        setting_row(ui, "Intensive glow", Some("Light the word being sung with a far stronger glow than the theme's own, the way am-lyrics does it. Strength sets how far it goes."), |ui| {
-            toggle(ui, &mut app.lyric_prefs.glow_boost, "Intensive glow");
+        setting_row(ui, "Lyrics at the screen's refresh rate", Some("Synced lyrics animate as fast as your screen refreshes, such as 144 fps on a 144 Hz monitor, instead of 60. Smoother on fast screens, for more CPU and graphics work."), |ui| {
+            if toggle(ui, &mut app.lyrics_full_rate, "Lyrics at the screen's refresh rate").changed() {
+                // A bundle (Settings › Appearance) set this too; a hand change isn't one.
+                app.visual = theme::VisualPreset::Custom;
+            }
         });
-        if app.lyric_prefs.glow_boost {
-            divider(ui);
-            setting_row(ui, "Glow strength", Some("How far the intensive glow goes, from a hint to all the way in."), |ui| {
-                let (min, max, step) = super::lyric_prefs::GLOW_STRENGTH;
-                let v = &mut app.lyric_prefs.glow_strength;
-                if ui.add_enabled(*v < max - 0.01, egui::Button::new("+").min_size(vec2(28.0, 26.0))).on_hover_text("Stronger").clicked() {
-                    *v = ((*v + step) * 10.0).round() / 10.0;
-                }
-                ui.label(egui::RichText::new(format!("{:.0}%", *v * 100.0)).font(theme::semibold(13.0)));
-                if ui.add_enabled(*v > min + 0.01, egui::Button::new("−").min_size(vec2(28.0, 26.0))).on_hover_text("Softer").clicked() {
-                    *v = ((*v - step) * 10.0).round() / 10.0;
-                }
-            });
-        }
         divider(ui);
         // Offsets: seconds taken off the lyrics clock, as the extension's dock sets them.
         for (title, desc, which) in [
@@ -2586,16 +3179,16 @@ fn settings_lyrics(app: &mut App, ui: &mut Ui) {
         let desc = "Tried in this order. Switch one off to skip it; the toolbar under the lyrics picks a different one for a single song.";
         let names = app.lyric_prefs.order.iter().map(|(p, _)| p.name()).collect::<Vec<_>>().join(" ");
         if filter_show(ui, &format!("Lyrics sources {desc} {names} order arrows")) {
-            setting_row_shown(ui, "Lyrics sources", Some(desc), |_| {});
+            setting_row_shown(ui, "Lyrics sources", Some(desc), 210.0, |_| {});
             let n = app.lyric_prefs.order.len();
             let mut swap: Option<(usize, usize)> = None;
-            for i in 0..n {
-                let (p, on) = app.lyric_prefs.order[i];
+            for (i, entry) in app.lyric_prefs.order.iter_mut().enumerate() {
+                let (p, on) = *entry;
                 let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
                 let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
                 let mut enabled = on;
                 if toggle(&mut row, &mut enabled, p.name()).changed() {
-                    app.lyric_prefs.order[i].1 = enabled;
+                    entry.1 = enabled;
                 }
                 row.add_space(10.0);
                 let kind = match p.sync() {
@@ -2629,7 +3222,7 @@ fn settings_artists(app: &mut App, ui: &mut Ui) {
         // The row and its link field are one unit in a search.
         let desc = "A link to your own signature API. Artists get their handwritten signature, with “Signed by …” above it, standing in for their name in the page header; without a signature, their name is set in type.";
         if filter_show(ui, &format!("Signature service {desc} link")) {
-            setting_row_shown(ui, "Signature service", Some(desc), |_| {});
+            setting_row_shown(ui, "Signature service", Some(desc), 210.0, |_| {});
             divider(ui);
             ui.add_space(12.0);
             if super::text_field(ui, "Link", &mut app.signature_api, false, "https://your-signature-service.example").changed() {
@@ -2668,20 +3261,52 @@ fn settings_appearance(app: &mut App, ui: &mut Ui) {
             app.appearance = a;
         }
         divider(ui);
+        // The row and its bundle: picking one sets every setting it owns, and changing
+        // any of those by hand (here or in Lyrics, for the refresh rate) returns to
+        // Custom, so the label never claims a bundle that isn't in force.
+        setting_row(ui, "Visual preset", Some("A bundle of the visual settings below. Barebones turns every animation, blur and glow off for older computers — Now playing becomes a flat backdrop with a still cover, and the lyrics take the Light renderer; nothing about playback changes. High visual turns them all on. Changing any of these settings afterwards returns to Custom."), |ui| {
+            let mut pick = None;
+            let btn = dropdown_button(ui, app.visual.label(), 160.0, "Visual preset");
+            egui::Popup::menu(&btn).show(|ui| {
+                ui.set_width(160.0);
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                ui.add_space(4.0);
+                for v in theme::VisualPreset::ALL {
+                    if option_row(ui, v.label(), v == app.visual).clicked() {
+                        pick = Some(v);
+                        ui.close();
+                    }
+                }
+                ui.add_space(4.0);
+            });
+            if let Some(v) = pick {
+                app.visual = v;
+                app.apply_visual(Some(ui.ctx()));
+            }
+        });
+        divider(ui);
         setting_row(ui, "Animated background", Some("The album art slowly drifts behind everything."), |ui| {
-            toggle(ui, &mut app.anim_bg, "Animated background");
+            if toggle(ui, &mut app.anim_bg, "Animated background").changed() {
+                app.visual = theme::VisualPreset::Custom;
+            }
         });
         divider(ui);
         setting_row(ui, "Pulse with the music", Some("The background swells with the beat."), |ui| {
-            toggle(ui, &mut app.reactive_bg, "Pulse with the music");
+            if toggle(ui, &mut app.reactive_bg, "Pulse with the music").changed() {
+                app.visual = theme::VisualPreset::Custom;
+            }
         });
         divider(ui);
-        setting_row(ui, "Accent-coloured controls", Some("The play button and volume slider in the accent colour, like the progress line."), |ui| {
-            toggle(ui, &mut app.accent_controls, "Accent-coloured controls");
+        setting_row(ui, "Ambient light", Some("Now playing glows with the video's colours around it."), |ui| {
+            if toggle(ui, &mut app.ambient_light, "Ambient light").changed() {
+                app.visual = theme::VisualPreset::Custom;
+            }
         });
         divider(ui);
         setting_row(ui, "Animated covers", Some("Where Apple Music has a clip for a song or its album, the cover moves in Now playing and on the album page, looping while the music plays and holding still when it's paused. Finding them sends each song's title and artist to Apple Music, remembered on disk so each song asks once."), |ui| {
-            toggle(ui, &mut app.animated_covers, "Animated covers");
+            if toggle(ui, &mut app.animated_covers, "Animated covers").changed() {
+                app.visual = theme::VisualPreset::Custom;
+            }
         });
         divider(ui);
         setting_row(ui, "Now playing backdrop", Some("What plays behind the full-screen player: the theme's own, or one of the alternatives without editing the theme."), |ui| {
@@ -2712,7 +3337,75 @@ fn settings_appearance(app: &mut App, ui: &mut Ui) {
             });
             if let Some(p) = pick {
                 app.np_bg = p;
+                app.visual = theme::VisualPreset::Custom;
             }
+        });
+        divider(ui);
+        setting_row(ui, "Reduce motion", Some("Every transition lands at once — panels, hover states, the now-playing slide — and a record cover stops spinning. The lyrics' own sweep keeps its timing; how fast it redraws is set in Lyrics."), |ui| {
+            if toggle(ui, &mut app.reduce_motion, "Reduce motion").changed() {
+                theme::set_motion(!app.reduce_motion);
+                theme::install_style(ui.ctx());
+                app.visual = theme::VisualPreset::Custom;
+            }
+        });
+        divider(ui);
+        setting_row(ui, "Cover shadow and glow", Some("The soft shadow and the glow under the cover in Now playing."), |ui| {
+            if toggle(ui, &mut app.cover_fx, "Cover shadow and glow").changed() {
+                app.visual = theme::VisualPreset::Custom;
+            }
+        });
+        divider(ui);
+        setting_row(ui, "Lyric blur and glow", Some("The theme's blur on lines still to come and glow on the word being sung, in Now playing. Off leaves every line sharp and plain — much less work per frame."), |ui| {
+            if toggle(ui, &mut app.lyric_fx, "Lyric blur and glow").changed() {
+                app.visual = theme::VisualPreset::Custom;
+            }
+        });
+        divider(ui);
+        // Moved in from Lyrics: a visual effect among the others, so the presets reach it
+        // (Barebones leaves it off with every other glow).
+        setting_row(ui, "Intensive glow", Some("Light the word being sung with a far stronger glow than the theme's own, the way am-lyrics does it. Strength sets how far it goes."), |ui| {
+            if toggle(ui, &mut app.lyric_prefs.glow_boost, "Intensive glow").changed() {
+                app.visual = theme::VisualPreset::Custom;
+            }
+        });
+        if app.lyric_prefs.glow_boost {
+            divider(ui);
+            setting_row(ui, "Glow strength", Some("How far the intensive glow goes, from a hint to all the way in."), |ui| {
+                let (min, max, step) = super::lyric_prefs::GLOW_STRENGTH;
+                let v = &mut app.lyric_prefs.glow_strength;
+                if ui.add_enabled(*v < max - 0.01, egui::Button::new("+").min_size(vec2(28.0, 26.0))).on_hover_text("Stronger").clicked() {
+                    *v = ((*v + step) * 10.0).round() / 10.0;
+                }
+                ui.label(egui::RichText::new(format!("{:.0}%", *v * 100.0)).font(theme::semibold(13.0)));
+                if ui.add_enabled(*v > min + 0.01, egui::Button::new("−").min_size(vec2(28.0, 26.0))).on_hover_text("Softer").clicked() {
+                    *v = ((*v - step) * 10.0).round() / 10.0;
+                }
+            });
+        }
+        divider(ui);
+        setting_row(ui, "Lyrics renderer", Some("How the synced lyrics are drawn. Full is every per-letter animation; Light, ported from Sonora, draws whole words with a plain clipped sweep and one eased scroll — much the same look for a fraction of the work each frame. It gives up the letter waves, the words' sideways pop and the line's swell; Barebones uses it."), |ui| {
+            let mut pick = None;
+            let btn = dropdown_button(ui, if app.lyric_light { "Light" } else { "Full" }, 160.0, "Lyrics renderer");
+            egui::Popup::menu(&btn).show(|ui| {
+                ui.set_width(160.0);
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                ui.add_space(4.0);
+                for (label, light) in [("Full", false), ("Light", true)] {
+                    if option_row(ui, label, light == app.lyric_light).clicked() {
+                        pick = Some(light);
+                        ui.close();
+                    }
+                }
+                ui.add_space(4.0);
+            });
+            if let Some(light) = pick {
+                app.lyric_light = light;
+                app.visual = theme::VisualPreset::Custom;
+            }
+        });
+        divider(ui);
+        setting_row(ui, "Accent-coloured controls", Some("The play button and volume slider in the accent colour, like the progress line."), |ui| {
+            toggle(ui, &mut app.accent_controls, "Accent-coloured controls");
         });
         divider(ui);
         setting_row(ui, "Font", Some("For the whole app and the lyrics. Any font installed on this computer works, e.g. one made for your language."), |ui| {
@@ -2764,12 +3457,42 @@ fn settings_zoom(ui: &mut Ui) {
     }
 }
 
+/// Settings › General's first card: the project's Discord server — the same place the
+/// update catalogue's news lands first.
+fn settings_community(ui: &mut Ui) {
+    settings_section(ui, "Community", None, None, |ui| {
+        setting_row(ui, "Join the Discord server", Some("Release news as it happens, help with the app, and the talk the project runs on."), |ui| {
+            if pill(ui, "Join server", Some(icon::USERS), true).clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(crate::discord::DISCORD_INVITE));
+            }
+        });
+    });
+}
+
 /// Settings › Window.
 fn settings_window(app: &mut App, ui: &mut Ui) {
     settings_section(ui, "Window", None, None, |ui| {
-        setting_row(ui, "Close to tray", Some("Clicking × hides the window and keeps the music playing. The tray icon is always up: left-click brings the window back, and its menu has the transport buttons, Launch at login and Quit. If the icon never shows up, launching BitChord again brings the window back; --no-tray starts a session without an icon, where × quits for real."), |ui| {
+        setting_row(ui, "Close to tray", Some("Clicking × hides the window and keeps the music playing. The tray icon is always up: left-click brings the window back, and its menu has the transport buttons, Launch at login and Quit. If the icon never shows up, launching BitChord again brings the window back; --no-tray starts a session without an icon, where × quits for real. On Linux, clicking the song in the system's media controls brings it back too, and Ctrl+Q quits."), |ui| {
             toggle(ui, &mut app.close_to_tray, "Close to tray");
         });
+        if let Some(e) = &app.tray_error {
+            ui.label(RichText::new(e).font(theme::regular(12.5)).color(theme::RED));
+            ui.add_space(8.0);
+        }
+        if crate::notify::SUPPORTED {
+            divider(ui);
+            let ok = crate::notify::available();
+            let desc = if ok {
+                "When a new song starts while the window is minimized, in the tray or behind other windows, show its title, artist and cover in a notification."
+            } else {
+                "Needs the installed app: Windows only shows notifications from apps in the Start menu."
+            };
+            ui.add_enabled_ui(ok, |ui| {
+                setting_row(ui, "Song notifications", Some(desc), |ui| {
+                    toggle(ui, &mut app.song_notifications, "Song notifications");
+                });
+            });
+        }
         divider(ui);
         setting_row(ui, "Launch at login", Some("Start BitChord when the computer does. The OS keeps this: the Run key on Windows, an autostart entry on Linux, a launch agent on macOS — and the tray menu's own Launch at login item flips the same switch."), |ui| {
             if toggle(ui, &mut app.launch_at_login, "Launch at login").changed() {
@@ -2841,57 +3564,9 @@ fn settings_window(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// Settings › Connections.
+/// Settings › Account › Connections: Last.fm scrobbling.
 fn settings_connections(app: &mut App, ui: &mut Ui) {
-    let mut discord_enabled = app.discord_enabled;
-    let linked = app.discord_link_token.is_some();
-    let (mut connect, mut disconnect) = (false, false);
     settings_section(ui, "Connections", None, None, |ui| {
-        let detail = match (&app.discord_link_user, linked) {
-            (Some(u), _) => format!("Showing what you play on {}'s Discord profile.", u.name),
-            (None, true) => "Discord is linked; presence shows on the linked account.".to_owned(),
-            (None, false) => "Show what you're playing on your Discord profile. Link an account for a card with buttons and cover art on your own profile.".to_owned(),
-        };
-        setting_row(ui, "Discord", Some(&detail), |ui| {
-            toggle(ui, &mut discord_enabled, "Discord");
-        });
-        divider(ui);
-        let status = app.discord_link.as_ref().map(|s| s.status()).unwrap_or(("off", None));
-        let link_detail = match (&status.1, app.discord_link_busy) {
-            (Some(p), _) => p.as_str(),
-            (None, true) => "Waiting for the Discord page…",
-            (None, false) if linked => match status.0 {
-                "ready" => "Linked account's presence is live.",
-                "connecting" => "Bringing the linked account's gateway up…",
-                "error" => "The linked account's gateway is down.",
-                _ => "Linked. Presence starts with the switch above.",
-            },
-            (None, false) => "Open discord.com and sign in; the app takes it from there.",
-        };
-        setting_row(ui, "Link account", Some(link_detail), |ui| {
-            if linked {
-                disconnect = pill(ui, "Disconnect", None, false).clicked();
-            } else if app.discord_link_busy {
-                ui.spinner();
-            } else {
-                connect = pill(ui, "Connect", None, false).clicked();
-            }
-        });
-        if linked {
-            divider(ui);
-            setting_row(ui, "Lead with the song", Some("Name the song, not the artist, in member lists."), |ui| {
-                toggle(ui, &mut app.discord_options.use_details, "song-first");
-            });
-            divider(ui);
-            text_option(ui, &mut app.discord_options.activity_name, "Listening to :", "BitChord");
-            divider(ui);
-            setting_row(ui, "Buttons on the card", Some("Two taps on the profile card, fixed: one opens the song on YouTube Music, one opens this project's page. The labels can't be changed, only switched off."), |ui| {
-                toggle(ui, &mut app.discord_options.button1_visible, crate::discord_link::DEFAULT_BUTTON_1);
-                ui.add_space(8.0);
-                toggle(ui, &mut app.discord_options.button2_visible, crate::discord_link::DEFAULT_BUTTON_2);
-            });
-        }
-        divider(ui);
         let busy = app.lastfm_busy.load(Ordering::Relaxed);
         let desc = match &app.lastfm_user {
             Some(name) => format!("Scrobbling what you play to {name}'s profile."),
@@ -2914,28 +3589,6 @@ fn settings_connections(app: &mut App, ui: &mut Ui) {
         if lf_disconnect {
             app.lastfm_sign_out();
         }
-    });
-    if connect {
-        app.link_discord();
-    }
-    if disconnect {
-        app.unlink_discord();
-    }
-    if discord_enabled != app.discord_enabled {
-        app.set_discord_enabled(discord_enabled);
-    }
-}
-
-/// A one-line option the listener types over (the card's labels).
-fn text_option(ui: &mut Ui, value: &mut String, label: &str, placeholder: &str) {
-    setting_row(ui, label, Some(&format!("Empty: \"{placeholder}\".")), |ui| {
-        let width = ui.available_width() - 140.0;
-        ui.add(
-            egui::TextEdit::singleline(value)
-                .hint_text(egui::RichText::new(placeholder).color(theme::text_faint()))
-                .font(theme::regular(13.0))
-                .desired_width(width.max(120.0)),
-        );
     });
 }
 
@@ -3064,13 +3717,6 @@ fn network(app: &mut App, ui: &mut Ui) {
     }
 }
 
-/// Paint `v` into `rect`, from the ICO entry that fits its size in physical pixels.
-pub(super) fn paint_app_icon(ui: &Ui, v: &crate::appicon::Variant, rect: Rect) {
-    let px = (rect.width() * ui.ctx().pixels_per_point()).ceil() as u32;
-    let png = v.png(px);
-    egui::Image::from_bytes(format!("bytes://app-icon/{}-{}.png", v.id, png.len()), png).paint_at(ui, rect);
-}
-
 /// The font setting: the theme's own, a bundled face, or one installed on this PC.
 /// Returns the new choice ("" for the theme's).
 fn font_picker(ui: &mut Ui) -> Option<String> {
@@ -3164,8 +3810,22 @@ fn output_device_picker(app: &mut App, ui: &mut Ui) {
     }
 }
 
+/// Volume normalization's description: what the levels do, and what it does to the song playing.
+fn normalization_desc(app: &App) -> String {
+    use crate::audio::Normalize;
+    let what = match app.normalize {
+        Normalize::Off => return "Songs play as loud as they were made. Normal brings them all to the same level, and Quiet to the same, lower one.".to_owned(),
+        Normalize::Normal => "Songs play at the same level: loud ones turned down, as on YouTube Music, and quiet ones up by as much as 6 dB.",
+        Normalize::Quiet => "Songs play at the same, lower level: loud ones turned down further, so quiet ones rarely need turning up.",
+    };
+    match (app.current().is_some(), super::shell::normalization_note(app)) {
+        (true, Some(note)) => format!("{what} This song: {note}."),
+        _ => what.to_owned(),
+    }
+}
+
 /// A dropdown's closed state: the chosen value and a chevron on a glass pill.
-fn dropdown_button(ui: &mut Ui, value: &str, width: f32, name: &str) -> egui::Response {
+pub(super) fn dropdown_button(ui: &mut Ui, value: &str, width: f32, name: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 36.0), Sense::click());
     let resp = widgets::named(resp, name).on_hover_cursor(egui::CursorIcon::PointingHand);
     let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
@@ -3178,7 +3838,7 @@ fn dropdown_button(ui: &mut Ui, value: &str, width: f32, name: &str) -> egui::Re
 }
 
 /// A dropdown option: hover glass, and a check on the chosen one.
-fn option_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
+pub(super) fn option_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
     let resp = widgets::named(resp, label).on_hover_cursor(egui::CursorIcon::PointingHand);
     let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.12);
@@ -3279,14 +3939,23 @@ pub(super) fn setting_row(ui: &mut Ui, title: &str, desc: Option<&str>, control:
     if !filter_show(ui, &format!("{title} {}", desc.unwrap_or_default())) {
         return;
     }
-    setting_row_shown(ui, title, desc, control);
+    setting_row_shown(ui, title, desc, 210.0, control);
+}
+
+/// A settings row whose controls take `control_w` rather than one control's 230, for a
+/// dropdown with a switch beside it (Discord's card lines).
+pub(super) fn setting_row_wide(ui: &mut Ui, title: &str, desc: Option<&str>, control_w: f32, control: impl FnOnce(&mut Ui)) {
+    if !filter_show(ui, &format!("{title} {}", desc.unwrap_or_default())) {
+        return;
+    }
+    setting_row_shown(ui, title, desc, control_w, control);
 }
 
 /// The row itself, without the filter check: for a block that's gated as one unit — a row
 /// and the widgets that belong to it show together or not at all.
-fn setting_row_shown(ui: &mut Ui, title: &str, desc: Option<&str>, control: impl FnOnce(&mut Ui)) {
+fn setting_row_shown(ui: &mut Ui, title: &str, desc: Option<&str>, control_w: f32, control: impl FnOnce(&mut Ui)) {
     let w = ui.available_width();
-    let text_w = (w - 230.0).max(200.0);
+    let text_w = (w - control_w - 20.0).max(200.0);
     let title_g = widgets::galley(ui, title, theme::semibold(14.5), theme::text(), text_w);
     // Up to three lines, and as many again for each line the description starts itself.
     let desc_g = desc.map(|d| widgets::galley_wrapped(ui, d, theme::regular(12.5), theme::text_dim(), text_w, 3 * (1 + d.matches('\n').count())));
@@ -3309,6 +3978,27 @@ pub(super) fn divider(ui: &mut Ui) {
     if !filtering() {
         divider_line(ui);
     }
+}
+
+/// A settings row that opens somewhere else: the whole row is the button, with a
+/// chevron on the right. A search that doesn't find it leaves it out.
+pub(super) fn open_row(ui: &mut Ui, title: &str, desc: &str) -> bool {
+    if !filter_show(ui, &format!("{title} {desc}")) {
+        return false;
+    }
+    let w = ui.available_width();
+    let text_w = (w - 230.0).max(200.0);
+    let title_g = widgets::galley(ui, title, theme::semibold(14.5), theme::text(), text_w);
+    let desc_g = widgets::galley_wrapped(ui, desc, theme::regular(12.5), theme::text_dim(), text_w, 3);
+    let text_h = title_g.size().y + desc_g.size().y + 3.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, (text_h + 26.0).max(58.0)), Sense::click());
+    let resp = named(resp, title).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let top = rect.center().y - text_h / 2.0;
+    let title_h = title_g.size().y;
+    ui.painter().galley(pos2(rect.left(), top), title_g, theme::text());
+    ui.painter().galley(pos2(rect.left(), top + title_h + 3.0), desc_g, theme::text_dim());
+    widgets::icon_at(ui, pos2(rect.right() - 8.0, rect.center().y), icon::CHEVRON_RIGHT, 16.0, theme::text_faint());
+    resp.clicked()
 }
 
 fn divider_line(ui: &mut Ui) {

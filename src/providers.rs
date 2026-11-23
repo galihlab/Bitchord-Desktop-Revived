@@ -28,7 +28,9 @@ const SEARCH_LIMIT: usize = 8;
 /// A stream whose size stays unknown gets this placeholder; the download finds the real
 /// end (the same trick the hi-res sources use).
 const SIZE_PLACEHOLDER: u64 = 512 * 1024 * 1024;
-const MONO_STREAMER: &str = "https://tracks.monochrome.st";
+/// Monochrome's own track streamer, which needs no setup: the settings' Test probes it
+/// the same way a pasted link is probed.
+pub const MONO_STREAMER: &str = "https://tracks.monochrome.st";
 /// The relay only answers clients that say which version of its api they speak.
 const RELAY_CLIENT: &str = "relay/2";
 
@@ -299,11 +301,19 @@ fn array_at<'a>(v: &'a Value, key: &str) -> Option<&'a Vec<Value>> {
 
 /// Songs looked up lately: the matches (so the next play skips the search) and the
 /// misses (so the next play of a song a provider hasn't got doesn't pay for it again).
+/// Order of arrival is kept, so a full memory sheds its oldest quarter rather than
+/// everything at once (a clear-all forgets a whole listening session's worth at the
+/// 513th song, and the next N songs each re-search).
 #[derive(Default)]
 struct Memory {
     matches: HashMap<String, Catalog>,
+    order: std::collections::VecDeque<String>,
     misses: HashMap<String, Instant>,
+    miss_order: std::collections::VecDeque<String>,
 }
+
+/// How many entries each half of the memory holds before it sheds its oldest quarter.
+const MEMORY_ENTRIES: usize = 512;
 
 impl Memory {
     fn hit(&self, key: &str) -> Option<Catalog> {
@@ -315,15 +325,25 @@ impl Memory {
     }
 
     fn remember(&mut self, key: &str, song: Catalog) {
-        if self.matches.len() > 512 {
-            self.matches.clear();
+        if !self.matches.contains_key(key) {
+            self.order.push_back(key.to_owned());
+            while self.order.len() > MEMORY_ENTRIES {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.matches.remove(&oldest);
+                }
+            }
         }
         self.matches.insert(key.to_owned(), song);
     }
 
     fn mark_miss(&mut self, key: &str) {
-        if self.misses.len() > 512 {
-            self.misses.clear();
+        if !self.misses.contains_key(key) {
+            self.miss_order.push_back(key.to_owned());
+            while self.miss_order.len() > MEMORY_ENTRIES {
+                if let Some(oldest) = self.miss_order.pop_front() {
+                    self.misses.remove(&oldest);
+                }
+            }
         }
         self.misses.insert(key.to_owned(), Instant::now());
     }
@@ -348,6 +368,30 @@ impl Outage {
 
     fn clear(&mut self, url: &str) {
         self.down.remove(url);
+    }
+}
+
+/// The lookup memory every Monochrome path shares. The addon lookups run outside any
+/// one instance (`resolve_addon_as_mono` has no `self` to come through), and the next
+/// play of a song shouldn't re-search whichever path found it.
+static MEMORY: LazyLock<Mutex<Memory>> = LazyLock::new(|| Mutex::new(Memory::default()));
+
+/// A server's kind, once it has answered as one. Asking costs a test search (or two,
+/// for a relay behind a streamer address), and the kind doesn't change while it runs.
+static IDENTIFIED: LazyLock<Mutex<HashMap<String, Kind>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The kind `base` answers as, remembered after the first ask; `fallback` while it
+/// hasn't answered as anything.
+async fn identified_kind(http: &reqwest::Client, base: &str, fallback: Kind) -> Kind {
+    if let Some(kind) = IDENTIFIED.lock().unwrap().get(base) {
+        return *kind;
+    }
+    match identify(http, base).await {
+        Some(kind) => {
+            IDENTIFIED.lock().unwrap().insert(base.to_owned(), kind);
+            kind
+        }
+        None => fallback,
     }
 }
 
@@ -672,7 +716,6 @@ pub struct Monochrome {
 }
 
 struct MonoInner {
-    memory: Memory,
     outage: Outage,
     /// The servers people added, tried before the built-in one since they were added for
     /// a reason. A link's kind is remembered once it has answered as one.
@@ -714,7 +757,7 @@ pub struct Server {
 
 impl Monochrome {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(MonoInner { memory: Memory::default(), outage: Outage::default(), added: Vec::new() }) }
+        Self { inner: Mutex::new(MonoInner { outage: Outage::default(), added: Vec::new() }) }
     }
 
     /// The servers people added, saved as `url|kind|name` lines (the built-in streamer
@@ -774,12 +817,9 @@ impl Monochrome {
     /// poison the Bitchord addon cache. If this also returns `None`, the caller falls
     /// through to the addon protocol (search + `/stream`).
     pub async fn resolve_addon_as_mono(http: &reqwest::Client, server: &Server, query: &Query<'_>) -> Option<Found> {
-        // Identify the kind first (unknown streamers are also tried as relays below).
-        let kind = match server.kind {
-            Kind::Streamer => Kind::Streamer,
-            _ => server.kind,
-        };
-        let identified = identify(http, &server.url).await.unwrap_or(kind);
+        // The kind is remembered after the first ask (a failure falls back as before,
+        // and asks again next song — a bad minute doesn't stick).
+        let identified = identified_kind(http, &server.url, server.kind).await;
         let try_kinds = match identified {
             Kind::Relay => vec![Kind::Relay],
             Kind::Streamer => vec![Kind::Streamer, Kind::Relay],
@@ -797,11 +837,10 @@ impl Monochrome {
     /// `resolve_addon_as_mono` uses it after identifying the endpoint’s kind.
     async fn resolve_one_direct(http: &reqwest::Client, server: &Server, query: &Query<'_>) -> Option<Found> {
         let key = format!("{}|{}", server.url, query.cache_key());
-        // Reuse the shared cache so repeat finds don't re-search.
+        // The shared memory: a hit here skips the search, the same as the instance path.
         let cached = {
-            let mono = Self::new();
-            let inner = mono.inner.lock().unwrap();
-            (inner.memory.missed(&key), inner.memory.hit(&key))
+            let memory = MEMORY.lock().unwrap();
+            (memory.missed(&key), memory.hit(&key))
         };
         let catalog = match cached.1 {
             Some(c) => c,
@@ -815,9 +854,7 @@ impl Monochrome {
                 let tracks = tracks_in(server.kind, &text);
                 let Some(best) = ranked(query, tracks).into_iter().next() else { return None };
                 drop(text);
-                // Write into a fresh instance's memory (the one the real callers use too).
-                let mono = Self::new();
-                mono.inner.lock().unwrap().memory.remember(&key, best.clone());
+                MEMORY.lock().unwrap().remember(&key, best.clone());
                 best
             }
         };
@@ -879,10 +916,10 @@ impl Monochrome {
             return None;
         }
         let key = format!("{}|{}", server.url, query.cache_key());
-        // The cache is read and written between the asks (its lock mustn't cross one).
+        // The lookup memory is process-wide (see `MEMORY`); its lock mustn't cross an ask.
         let cached = {
-            let inner = self.inner.lock().unwrap();
-            (inner.memory.missed(&key), inner.memory.hit(&key))
+            let memory = MEMORY.lock().unwrap();
+            (memory.missed(&key), memory.hit(&key))
         };
         if cached.0 {
             return None;
@@ -906,11 +943,11 @@ impl Monochrome {
                 };
                 let tracks = tracks_in(server.kind, &text);
                 let Some(best) = ranked(query, tracks).into_iter().next() else {
-                    self.inner.lock().unwrap().memory.mark_miss(&key);
+                    MEMORY.lock().unwrap().mark_miss(&key);
                     log::info!("monochrome {}: no matching recording of \u{201c}{}\u{201d}", server.name, query.title);
                     return None;
                 };
-                self.inner.lock().unwrap().memory.remember(&key, best.clone());
+                MEMORY.lock().unwrap().remember(&key, best.clone());
                 best
             }
         };

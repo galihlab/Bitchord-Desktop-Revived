@@ -3,12 +3,14 @@
   <p><strong>A fast, native YouTube Music desktop app — rebuilt in Rust.</strong></p>
   <p>Built with egui and rodio. No Electron, no embedded browser player, and light on memory while playing.</p>
 
-  <p>
+<p>
     <a href="https://github.com/LoserDenji/Bitchord-Desktop-Revived/releases/latest"><img src="https://img.shields.io/github/v/release/LoserDenji/Bitchord-Desktop-Revived?style=flat-square&color=a855f7&labelColor=0d1117" alt="Latest release"></a>
     <a href="https://github.com/LoserDenji/Bitchord-Desktop-Revived/releases"><img src="https://img.shields.io/github/downloads/LoserDenji/Bitchord-Desktop-Revived/total?style=flat-square&color=a855f7&labelColor=0d1117" alt="Downloads"></a>
     <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-333?style=flat-square&labelColor=0d1117" alt="Platforms">
     <a href="LICENSE"><img src="https://img.shields.io/github/license/LoserDenji/Bitchord-Desktop-Revived?style=flat-square&color=333&labelColor=0d1117" alt="License: GPL-3.0"></a>
+    <a href="https://discord.gg/bn2u89xUeH"><img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=flat-square&labelColor=0d1117&logo=discord&logoColor=white" alt="Discord"></a>
   </p>
+  join my very kool server : https://discord.gg/bn2u89xUeH
 
   <p>
     <a href="https://github.com/LoserDenji/Bitchord-Desktop-Revived/releases/latest">Download</a> ·
@@ -20,7 +22,7 @@
 
 > BitChord is an independent, unofficial client. It is not affiliated with, endorsed by, or connected to YouTube, Google, or Apple.
 
-## Screenshots (thx [unwrten]([github.com/](https://github.com/unwrten)))
+## Screenshots (thx [unwrten](https://github.com/unwrten))
 
 <table>
   <tr>
@@ -52,7 +54,7 @@
 
 **Lyrics and interface**
 - **Synced lyrics** — timed lyrics with provider fallbacks, timing controls, romanization and translation options.
-- **Native Rust desktop UI** — a fast egui/rodio interface with system media controls, tray integration, and keyboard-friendly navigation.
+- **Native Rust desktop UI** — a fast egui/rodio interface with system media controls, tray integration, song notifications while the window is in the background, and keyboard-friendly navigation.
 - **Discord Rich Presence** — show what you’re listening to on Discord.
 - **Last.fm scrobbling** — connect your Last.fm account in Settings.
 
@@ -92,7 +94,7 @@ Sign-ins are kept in your login Keychain. Jam links don't open the app on macOS 
 curl -fsSL https://raw.githubusercontent.com/LoserDenji/Bitchord-Desktop-Revived/main/linux/install.sh | sh
 ```
 
-This installs bitchord for your user (no root) in `~/.local/lib/ytm-rs`, with a `ytm-rs` command and an app menu entry. If WebKitGTK or other required libraries are missing, it installs them too (that step asks for your password). You can also download `bitchord-<version>-linux-x86_64.tar.gz`, extract it and run `./install.sh`.
+This installs bitchord for your user (no root) in `~/.local/lib/ytm-rs`, with a `ytm-rs` command and an app menu entry. If WebKitGTK, other required libraries or desktop-file-utils (which lets the browser open jam and party links in the app) are missing, it installs them too (that step asks for your password). You can also download `bitchord-<version>-linux-x86_64.tar.gz`, extract it and run `./install.sh`.
 
 On Debian, Ubuntu and their derivatives you can instead download `bitchord_<version>_amd64.deb` and open it, or run `sudo apt install ./ytm-rs_<version>_amd64.deb`. It doesn't update itself: when a new version is out, the app says so and links to the new `.deb`, which installs over the old one. To uninstall it, run `sudo apt remove ytm-rs`.
 
@@ -154,9 +156,11 @@ BitChord Desktop Revived is licensed under [GPL-3.0](LICENSE).
 
 ## Acknowledgements
 
-- [BitChord](https://github.com/kushagrasinghx/BitChord) for the the orignal android app
+- The original Android app and the Liquid Glass icon are from [BitChord](https://github.com/kushagrasinghx/BitChord).
 - [ytm-rs](https://github.com/grapedjuice/ytm-rs) for the base of the app which was later modified by jackychan4891
 - [jackychan4891](https://github.com/jackychan4891/BitChord-PC-Continued) for the modification in ytm-rs app for parity with BitChord
+- [Sonora](https://github.com/sonorahq/sonora) for optimization and feature inspirations
+- [Mochy-Music](https://github.com/realidkroo/Mochy-Music) for the recommendation system and gatcha system
 - [egui](https://github.com/emilk/egui) for the interface.
 - [rodio](https://github.com/RustAudio/rodio) and Symphonia for audio playback and decoding.
 - Lyrics, metadata, playback, and integrations depend on the upstream libraries and third-party services used by this project.

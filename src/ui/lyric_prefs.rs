@@ -20,7 +20,8 @@ pub struct Prefs {
     /// Lyrics text size, as a multiple of the theme's own size.
     pub text_scale: f32,
     /// Intensive glow: the sung words' drop-shadow lit far harder than the look asks
-    /// (am-lyrics'), with the listener's own strength on top.
+    /// (am-lyrics'), with the listener's own strength on top. Set in Appearance, where
+    /// the visual presets can reach it.
     pub glow_boost: bool,
     /// How hard, 0..1, when [`Self::glow_boost`] is on.
     pub glow_strength: f32,

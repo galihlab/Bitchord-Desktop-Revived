@@ -21,18 +21,20 @@ pub enum Cmd {
     SeekBackward,
     VolumeUp,
     VolumeDown,
+    Mute,
     Lyrics,
     Queue,
     NowPlaying,
     FullScreen,
     Search,
+    Palette,
     MiniPlayer,
     Back,
     Forward,
 }
 
 impl Cmd {
-    pub const ALL: [Cmd; 15] = [
+    pub const ALL: [Cmd; 17] = [
         Self::TogglePlay,
         Self::Next,
         Self::Prev,
@@ -40,11 +42,13 @@ impl Cmd {
         Self::SeekBackward,
         Self::VolumeUp,
         Self::VolumeDown,
+        Self::Mute,
         Self::Lyrics,
         Self::Queue,
         Self::NowPlaying,
         Self::FullScreen,
         Self::Search,
+        Self::Palette,
         Self::MiniPlayer,
         Self::Back,
         Self::Forward,
@@ -59,11 +63,13 @@ impl Cmd {
             Self::SeekBackward => "Seek backwards",
             Self::VolumeUp => "Volume up",
             Self::VolumeDown => "Volume down",
+            Self::Mute => "Mute",
             Self::Lyrics => "Lyrics",
             Self::Queue => "Queue",
             Self::NowPlaying => "Now playing",
             Self::FullScreen => "Full-screen player",
             Self::Search => "Search",
+            Self::Palette => "Command palette",
             Self::MiniPlayer => "Mini player",
             Self::Back => "Back",
             Self::Forward => "Forward",
@@ -80,11 +86,13 @@ impl Cmd {
             Self::SeekBackward => "keybind_seek_backward",
             Self::VolumeUp => "keybind_vol_up",
             Self::VolumeDown => "keybind_vol_down",
+            Self::Mute => "keybind_mute",
             Self::Lyrics => "keybind_lyrics",
             Self::Queue => "keybind_queue",
             Self::NowPlaying => "keybind_np",
             Self::FullScreen => "keybind_full",
             Self::Search => "keybind_search",
+            Self::Palette => "keybind_palette",
             Self::MiniPlayer => "keybind_mini",
             Self::Back => "keybind_back",
             Self::Forward => "keybind_forward",
@@ -94,6 +102,7 @@ impl Cmd {
     /// What the key does by default. Seek keeps the plain arrows the songs' skip leaves
     /// free, volume the Ctrl arrows. Back and forward read the browser's own: on a Mac
     /// that's the Command key, which is what took Alt's place there (Macs have no Alt).
+    /// Mute is the bare M, clear of Ctrl+M (the mini player).
     fn default_combo(self) -> &'static str {
         match self {
             Self::TogglePlay => "Space",
@@ -103,11 +112,13 @@ impl Cmd {
             Self::SeekBackward => "ArrowLeft",
             Self::VolumeUp => "ctrl+ArrowUp",
             Self::VolumeDown => "ctrl+ArrowDown",
+            Self::Mute => "M",
             Self::Lyrics => "L",
             Self::Queue => "Q",
             Self::NowPlaying => "F",
             Self::FullScreen => "shift+F",
             Self::Search => "Slash",
+            Self::Palette => if cfg!(target_os = "macos") { "cmd+K" } else { "ctrl+K" },
             Self::MiniPlayer => "ctrl+M",
             Self::Back => if cfg!(target_os = "macos") { "cmd+ArrowLeft" } else { "alt+ArrowLeft" },
             Self::Forward => if cfg!(target_os = "macos") { "cmd+ArrowRight" } else { "alt+ArrowRight" },
@@ -155,6 +166,28 @@ impl Bindings {
     /// mini player's toggle wants).
     pub fn matches_once(&self, cmd: Cmd, ctx: &egui::Context) -> bool {
         self.pressed(cmd, ctx, true)
+    }
+
+    /// The command's combination went down this once, taken with it: nothing later in
+    /// the frame sees the key. A text box's Ctrl+K, say, deletes to the end of the line
+    /// when it's left the event alone, so the palette takes the key first.
+    pub fn take_once(&self, cmd: Cmd, ctx: &egui::Context) -> bool {
+        let Some((want_mods, want_key)) = parse_combo(self.get(cmd)) else { return false };
+        let (want_ctrl, want_shift, want_alt, want_cmd) = want_mods.map_or((false, false, false, false), |m| (m.ctrl, m.shift, m.alt, m.mac_cmd));
+        let same_mods = |m: egui::Modifiers| m.ctrl == want_ctrl && m.shift == want_shift && m.alt == want_alt && m.mac_cmd == want_cmd;
+        let mut taken = false;
+        ctx.input_mut(|i| {
+            i.events.retain_mut(|e| {
+                if let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = e {
+                    if *key == want_key && same_mods(*modifiers) {
+                        taken = true;
+                        return false;
+                    }
+                }
+                true
+            });
+        });
+        taken
     }
 
     fn pressed(&self, cmd: Cmd, ctx: &egui::Context, once: bool) -> bool {

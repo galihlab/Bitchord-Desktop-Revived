@@ -458,7 +458,7 @@ fn on_event(app: &mut App, e: party::Event) {
                 app.toast("Joined the party");
             }
         }
-        party::Event::Connection(_) => {}
+        party::Event::Connection => {}
         party::Event::Ended(reason) => {
             if app.party.conn.take().is_some() {
                 let error = app.party.error.clone();
@@ -1012,9 +1012,15 @@ fn top_up_autoplay(app: &mut App) {
         .chain(state.queue.items.iter().map(|t| t.video_id.clone()))
         .collect();
     let waiting_ids: HashSet<String> = waiting.iter().map(|t| t.video_id.clone()).collect();
+    // the party's station is picked from the host's taste the queue's own is: what
+    // their listening has ruled out never joins the party, though nothing stops a
+    // member asking for a song by hand
+    let taste = crate::recommend::TasteLite::of(&app.listening, app.hide_explicit);
     app.backend.spawn(async move {
         let mut fresh: Vec<PartyTrack> = Vec::new();
-        match crate::ytm::radio(&api, &seed, false, 50).await {
+        match crate::ytm::radio(&api, &seed, false, 50).await.map(|candidates| {
+            crate::recommend::queue_radio(candidates, &taste, 2, &mut crate::recommend::Rng::new())
+        }) {
             Ok(candidates) => {
                 for t in candidates {
                     if fresh.len() >= needed {

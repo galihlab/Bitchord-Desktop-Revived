@@ -345,12 +345,25 @@ static LAST: Mutex<Option<(String, u32, Arc<Clip>)>> = Mutex::new(None);
 
 /// Fetches the clip at `url` (an HLS playlist), in the rendition for `side` px.
 pub async fn load(http: &reqwest::Client, url: &str, side: u32) -> anyhow::Result<Arc<Clip>> {
+    load_bounded(http, url, side, usize::MAX).await
+}
+
+pub(crate) async fn load_bounded(http: &reqwest::Client, url: &str, side: u32, limit: usize) -> anyhow::Result<Arc<Clip>> {
     if let Some((_, _, clip)) = LAST.lock().unwrap().as_ref().filter(|(u, s, _)| u == url && *s == side) {
+        anyhow::ensure!(clip.init.len() + clip.segments.iter().map(Vec::len).sum::<usize>() <= limit, "animated cover clip is too large");
         return Ok(clip.clone());
     }
     let base = url::Url::parse(url)?;
     let text = |u: url::Url| async move { anyhow::Ok(http.get(u).header("User-Agent", UA).timeout(Duration::from_secs(20)).send().await?.error_for_status()?.text().await?) };
-    let bytes = |u: url::Url| async move { anyhow::Ok(http.get(u).header("User-Agent", UA).timeout(Duration::from_secs(30)).send().await?.error_for_status()?.bytes().await?.to_vec()) };
+    let bytes = |u: url::Url, limit: usize| async move {
+        let mut response = http.get(u).header("User-Agent", UA).timeout(Duration::from_secs(30)).send().await?.error_for_status()?;
+        let mut out = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(chunk.len() <= limit.saturating_sub(out.len()), "animated cover clip is too large");
+            out.extend_from_slice(&chunk);
+        }
+        anyhow::Ok(out)
+    };
     let mut playlist_url = base.clone();
     let mut playlist = text(base.clone()).await?;
     let all = variants(&playlist);
@@ -362,13 +375,16 @@ pub async fn load(http: &reqwest::Client, url: &str, side: u32) -> anyhow::Resul
     }
     let (init, files) = media(&playlist).ok_or_else(|| anyhow::anyhow!("not fragmented MP4"))?;
     let mut out = Vec::with_capacity(files.len());
+    let mut remaining = limit;
     for f in &files {
-        out.push(bytes(playlist_url.join(f)?).await?);
+        let segment = bytes(playlist_url.join(f)?, remaining).await?;
+        remaining -= segment.len();
+        out.push(segment);
     }
     // In one of those files, the init segment is at its start: only that much of it again.
     let init = match files.iter().position(|f| *f == init) {
         Some(i) => out[i][..head_len(&out[i])].to_vec(),
-        None => bytes(playlist_url.join(&init)?).await?,
+        None => bytes(playlist_url.join(&init)?, remaining).await?,
     };
     log::info!("animated cover: {} file(s), {} KB", files.len(), out.iter().map(Vec::len).sum::<usize>() / 1024);
     let clip = Arc::new(Clip { init, segments: out });

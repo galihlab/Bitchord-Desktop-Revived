@@ -11,7 +11,7 @@ use crate::lyrics::Lyrics;
 use crate::model::Track;
 
 use super::queue::QueueFill;
-use super::{App, MixFrom, PlayingAs, Repeat, Session, jam, lyric_prefs};
+use super::{App, MixFrom, PlayingAs, Repeat, Session, Watched, lyric_prefs};
 
 /// Where in the blend the two songs trade places: the outgoing one holds its level for
 /// the first 30% (see `audio::mix_handoff`) and the curves are mirrors, so the next song
@@ -140,13 +140,58 @@ impl App {
         }
     }
 
-    /// Play the current music video as itself again, from where its song is now: a jam
-    /// plays everyone the host's exact upload.
+    /// The song of what's playing, for scrobbles: the song version standing in for a
+    /// music video, or the song a music video stands in for.
+    pub(super) fn heard_song(&self) -> Option<&Track> {
+        self.playing_as().filter(|t| !t.has_video()).or(self.current())
+    }
+
+    /// The video on show, when one is: the music video playing, or the one picked on a
+    /// song's switch. Lyrics are timed to the song, so they don't go with it.
+    pub(super) fn shown_video(&self) -> Option<&Track> {
+        let t = self.playing_track().filter(|t| t.has_video() && !self.jam.active())?;
+        (self.show_video || self.playing_as().is_some()).then_some(t)
+    }
+
+    /// What the Song/Video switch shows picked: on a song, whether its music video plays
+    /// in its place; on a video, the Video preference.
+    pub(super) fn video_picked(&self) -> bool {
+        match self.current() {
+            Some(t) if !t.has_video() => self.playing_as().is_some(),
+            _ => self.show_video,
+        }
+    }
+
+    /// The current song's music video, for its Song/Video switch. Asked for the first
+    /// time it's wanted, once per song.
+    pub(super) fn song_video(&mut self) -> Option<&crate::ytm::MusicVideo> {
+        let t = self.current().filter(|t| !t.has_video() && !self.jam.active())?;
+        if !self.music_videos.contains_key(&t.id) {
+            let t = t.clone();
+            if self.music_videos.len() >= 1000 {
+                self.music_videos.clear();
+            }
+            self.music_videos.insert(t.id.clone(), None);
+            self.backend.request(Req::MusicVideo(t));
+            return None;
+        }
+        let found = self.music_videos.get(&t.id)?.as_ref()?;
+        (!(self.hide_explicit && found.video.explicit)).then_some(found)
+    }
+
+    /// How far the music video playing for the current song runs ahead of the song.
+    fn video_offset(&self) -> i64 {
+        let (Some(song), Some(video)) = (self.current(), self.playing_as()) else { return 0 };
+        self.music_videos.get(&song.id).and_then(Option::as_ref).filter(|m| m.video.id == video.id).map_or(0, |m| m.offset_ms)
+    }
+
+    /// Play the current music video as itself again, from where its song is now. Not in
+    /// a party: the switch stays out of rooms, whose songs each device plays its own way.
     pub(super) fn play_listed_upload(&mut self) {
         if self.playing_as().is_none() {
             return;
         }
-        let at = self.audio.status.position();
+        let at = shifted(self.audio.status.position(), -self.video_offset());
         self.playing_as = None;
         if self.playing() || self.buffering {
             self.play_current_at(at, false);
@@ -155,23 +200,69 @@ impl App {
         }
     }
 
-    /// `t`, when it's a music video to play as its song version. Not in a jam: everyone
-    /// there plays the host's exact upload at the host's position.
+    /// From a song to its music video, at the same place in the song: the video stands
+    /// in for it as a song version does for a video, so it's the same play.
+    pub(super) fn play_music_video(&mut self) {
+        if self.playing_as().is_some() {
+            return;
+        }
+        let Some(found) = self.song_video().cloned() else { return };
+        let Some(listed) = self.current_id().map(str::to_owned) else { return };
+        let at = shifted(self.audio.status.position(), found.offset_ms);
+        self.playing_as = Some(PlayingAs { generation: self.generation, listed, song: found.video });
+        if self.playing() || self.buffering {
+            self.start_current(at, false, true);
+        } else {
+            self.resume_at = Some(at);
+        }
+    }
+
+    /// `t`, when it's a music video to play as its song version. A party shares song ids,
+    /// not streams: each device plays the best copy of the song it has.
     pub(super) fn song_of(&self, t: &Track) -> Option<Track> {
-        (self.play_songs && !self.show_video && t.music_video && !self.jam.active()).then(|| t.clone())
+        (self.play_songs && !self.show_video && t.music_video).then(|| t.clone())
     }
 
     pub(super) fn playing(&self) -> bool {
         self.audio.status.playing.load(Ordering::Relaxed)
     }
 
-    /// Fetch the current song's art for the background and accent.
+    /// Watch what each song actually gets of listening, for the events and skips
+    /// Home grows from (see `listening`). The watched song is the listed one, so the
+    /// Song/Video switch mid-song doesn't split it into two plays; the seconds count
+    /// only while the player runs, and settle the moment the song stops being current.
+    pub(super) fn watch_listening(&mut self, now: f64) {
+        let dt = (now - self.watched_frame).max(0.0) as f32;
+        self.watched_frame = now;
+        let current = self.current().cloned();
+        let same = self.watched.as_ref().is_some_and(|w| current.as_ref().is_some_and(|c| c.id == w.track.id));
+        if same {
+            if self.playing() {
+                let w = self.watched.as_mut().unwrap();
+                // the event's timestamp is when the song began, not when it was queued
+                w.started.get_or_insert_with(crate::listening::unix_now);
+                w.played += dt;
+            }
+            return;
+        }
+        if let Some(w) = self.watched.take() {
+            let started = w.started.unwrap_or_else(crate::listening::unix_now);
+            self.listening.note_left(w.track, started, w.played);
+            self.listening.store(self.backend.data_dir());
+        }
+        if let Some(c) = current {
+            self.watched = Some(Watched { track: c, started: None, played: 0.0 });
+        }
+    }
+
+    /// Fetch the current song's art for the background and accent. A local song's
+    /// cover is a file the backend reads, not a fetch (see `art_uri`).
     pub(super) fn request_art(&mut self) {
         let Some(track) = self.current() else { return };
         if self.art_key.as_deref() == Some(track.id.as_str()) {
             return;
         }
-        if let Some(url) = backend::art_url(track) {
+        if let Some(url) = backend::art_uri(track) {
             let key = track.id.clone();
             self.backend.request(Req::Art { key, url });
         }
@@ -297,6 +388,7 @@ impl App {
 
     pub(super) fn play_current(&mut self) {
         self.recoveries = 0;
+        super::jam::hand_picked(self);
         self.play_current_at(Duration::ZERO, true);
     }
 
@@ -319,10 +411,12 @@ impl App {
             self.start_current(at, false, true);
         } else {
             self.resume_at = Some(at);
+            self.resume_as_song = true;
         }
     }
 
     fn start_current(&mut self, at: Duration, report: bool, as_song: bool) {
+        let as_song = std::mem::take(&mut self.resume_as_song) || as_song;
         let Some(track) = self.current().cloned() else { return };
         // A natural Automix handoff keeps the outgoing song on screen until the next one
         // is louder (see `MixFrom`); any other play switches at once.
@@ -332,18 +426,24 @@ impl App {
         }
         // Picking up mid-song (a resume, a download that broke off): the position is the
         // song version's when one was playing, so that goes on; a music video stays one.
-        let carried = if at.is_zero() || self.jam.active() { None } else { self.playing_as().cloned() };
+        let carried = if at.is_zero() { None } else { self.playing_as().cloned() };
         self.queue.started();
         self.resume_at = None;
         self.resume_counts = false;
         self.generation += 1;
         self.audio.status.wanted_gen.store(self.generation, Ordering::Relaxed);
         self.audio_info = None;
+        // The new song's stream stats arrive with its own decoder; a background
+        // upgrade under way was for the song before it.
+        self.stream_stats = None;
+        self.upgrading_quality = false;
+        self.upgrade_asked = false;
         let shown = carried.clone().unwrap_or_else(|| track.clone());
         self.audio.status.duration_ms.store(shown.duration.map_or(0, |d| d as u64 * 1000), Ordering::Relaxed);
         // A song running into the next crossfades (so does Next, when that's switched
         // on); going back or picking a song cuts over.
         self.audio.send(if self.handoff && at.is_zero() { AudioCmd::Handoff } else { AudioCmd::Stop });
+        self.audio.send(AudioCmd::Warm);
         self.buffering = true;
         self.seek_drag = None;
         // A carried song version goes with its music video, which plays if the song won't.
@@ -371,9 +471,12 @@ impl App {
         let Some(m) = &mut self.media else { return };
         // Windows fetches a cover URL on its own, through its own proxy setting only.
         let by_url = matches!(crate::proxy::active(), crate::proxy::Setting::System);
+        // A local song's cover is a file already: the OS reads it from where it is.
+        let local = crate::local::cover_file(&track.id).map(|p| format!("file://{}", p.display()));
         let art = backend::art_url(&track);
-        m.set_track(&shown.title, &shown.artist_line(), shown.album.as_ref().map(|a| a.name.as_str()), art.as_deref().filter(|_| by_url), shown.duration);
-        if !by_url && let Some(url) = art {
+        let cover = local.as_deref().or_else(|| art.as_deref().filter(|_| by_url));
+        m.set_track(&shown.title, &shown.artist_line(), shown.album.as_ref().map(|a| a.name.as_str()), cover, shown.duration);
+        if !by_url && local.is_none() && let Some(url) = art {
             self.fetch_media_cover(track.id.clone(), url);
         }
     }
@@ -390,13 +493,36 @@ impl App {
     }
 
     /// Keep the queue topped up so autoplay never stalls at the end; a playlist still
-    /// coming in goes first.
+    /// coming in goes first. The seed drifts — the newest queue song this session
+    /// hasn't grown a radio from yet, so the queue keeps moving forward instead of
+    /// orbiting one mix (Mochy's infinite queue does the same); an answer that lands
+    /// nothing cools off first, so a dead station can't become a request a frame.
     pub(super) fn top_up(&mut self) {
-        if self.autoplay && !self.radio_pending && !self.jam.guest() && self.queue.fill.is_none() && self.queue.at_end()
-            && let Some(t) = self.current().cloned()
+        if let Some(at) = self.radio_retry_at
+            && std::time::Instant::now() < at
         {
-            self.radio_pending = true;
-            self.backend.request(Req::Radio { song_of: self.song_of(&t), seed: t.id });
+            return;
+        }
+        if self.autoplay && !self.radio_pending && !self.jam.follows() && self.queue.fill.is_none() && self.queue.at_end() {
+            let banned = &self.listening.banned;
+            let seed = self
+                .queue
+                .tracks
+                .iter()
+                .rev()
+                .find(|t| !crate::local::is_local(&t.id) && !self.used_radio_seeds.contains(&t.id) && !banned.contains(&t.id))
+                .cloned()
+                .or_else(|| self.current().cloned().filter(|t| !crate::local::is_local(&t.id)));
+            if let Some(t) = seed {
+                self.radio_pending = true;
+                self.used_radio_seeds.push_back(t.id.clone());
+                if self.used_radio_seeds.len() > 100 {
+                    self.used_radio_seeds.pop_front();
+                }
+                // the queue's own radio: picked from the taste, the way Home's rows are
+                let taste = crate::recommend::TasteLite::of(&self.listening, self.hide_explicit);
+                self.backend.request(Req::AutoRadio { song_of: self.song_of(&t), seed: t.id, taste });
+            }
         }
     }
 
@@ -439,6 +565,7 @@ impl App {
             self.page = super::Page::Library(super::LibTab::Playlists);
         }
         self.search = None;
+        self.home_mood = false;
         self.backend.request(Req::Home(None));
         if self.logged_in {
             self.backend.request(Req::Library);
@@ -446,11 +573,11 @@ impl App {
     }
 
     /// Explicit songs hidden or shown again: queued ones go (all but the one playing; a
-    /// jam guest's queue is the host's), and YouTube's Restricted Mode applies to what
+    /// follower's queue is the room's), and YouTube's Restricted Mode applies to what
     /// loads from now on.
     pub(super) fn set_hide_explicit(&mut self) {
         self.queue.hide_explicit = self.hide_explicit;
-        if !self.jam.guest() {
+        if !self.jam.follows() {
             self.queue.drop_explicit();
             // What was fetched ahead may have gone.
             self.prefetch_next();
@@ -469,9 +596,10 @@ impl App {
     }
 
     /// Jump over a SponsorBlock segment once playback is inside it; one that runs to the
-    /// end finishes the song. A guest in a jam follows the host, who does the skipping.
+    /// end finishes the song. A member who doesn't drive the party follows it, and the one
+    /// who does skips for everyone.
     pub(super) fn skip_segments(&mut self, ctx: &egui::Context, now: f64) {
-        if !self.sponsorblock || self.jam.guest() || self.resume_at.is_some() || self.buffering || !self.playing() {
+        if !self.sponsorblock || self.jam.follows() || self.resume_at.is_some() || self.buffering || !self.playing() {
             return;
         }
         let Some((id, segs)) = &self.segments else { return };
@@ -512,8 +640,8 @@ impl App {
     }
 
     pub(super) fn next(&mut self) {
-        if self.jam.guest() {
-            return jam::request(self, crate::jam::Cmd::Skip);
+        if self.jam.locked() {
+            return self.toast("Only the host can change the party");
         }
         if !self.queue.advance() {
             return;
@@ -522,8 +650,8 @@ impl App {
     }
 
     pub(super) fn prev(&mut self) {
-        if self.jam.guest() {
-            return jam::request(self, crate::jam::Cmd::Prev);
+        if self.jam.locked() {
+            return self.toast("Only the host can change the party");
         }
         if self.audio.status.position() > Duration::from_secs(3) {
             self.seek_to(Duration::ZERO);
@@ -535,6 +663,12 @@ impl App {
     }
 
     pub(super) fn seek_to(&mut self, at: Duration) {
+        // A needle this device moved is the room's to hear about; `publish` keeps telling
+        // it until the room agrees. Only hand seeks come through here — the sync's own
+        // corrections seek the player directly, so drift never gets reported as a move.
+        if self.jam.active() {
+            self.jam.pending_seek = Some(at.as_millis() as u64);
+        }
         if self.resume_at.is_some() {
             // Restored but not loaded yet (nothing for the player to seek): move the start point instead.
             self.resume_at = Some(at);
@@ -548,8 +682,12 @@ impl App {
         if self.queue.index.is_none() {
             return;
         }
-        if self.jam.guest() {
-            return jam::request(self, crate::jam::Cmd::Toggle);
+        if self.jam.active() && !(self.jam.locked() && !self.playing()) {
+            // Play and pause are the room's to know, so say so here first: that keeps the
+            // sync from walking us straight back to the room's still-unmoved state while
+            // our own ask is on its way. In a room only the host drives, a play stays the
+            // room's alone, and a pause is ours.
+            self.jam.intent = Some(!self.playing());
         }
         if let Some(at) = self.resume_at {
             // Last session's song, already counted when it started then (unless it was
@@ -566,8 +704,8 @@ impl App {
     /// Shuffle up next, or back to the original order: a toggle, so a playlist or album
     /// can return to its sequence.
     pub(super) fn shuffle_toggle(&mut self) {
-        if self.jam.guest() {
-            return self.toast("Only the host can shuffle the jam");
+        if self.jam.locked() {
+            return self.toast("Only the host can shuffle the party");
         }
         match self.queue.shuffle_toggle() {
             Some(true) => {
@@ -585,4 +723,13 @@ impl App {
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// A position moved by `ms` milliseconds, which can be negative.
+pub(super) fn shifted(pos: Duration, ms: i64) -> Duration {
+    if ms >= 0 {
+        pos + Duration::from_millis(ms as u64)
+    } else {
+        pos.saturating_sub(Duration::from_millis(ms.unsigned_abs()))
+    }
 }

@@ -253,12 +253,19 @@ pub struct Client {
     /// When the Turnstile challenge last failed; it isn't retried for a while, so
     /// every new song doesn't start another WebView2.
     challenge_failed: std::sync::Mutex<Option<std::time::Instant>>,
-    /// The last few songs' lyrics, for replays and going back.
-    recent: std::sync::Mutex<std::collections::VecDeque<(String, LyricsSet)>>,
+    /// The last few songs' lyrics, for replays and going back. Shared, so a replay or
+    /// a racing second ask hands out the same set instead of a copy of it.
+    recent: std::sync::Mutex<std::collections::VecDeque<(String, std::sync::Arc<LyricsSet>)>>,
+    /// Fetches under way, so two asks for the same song (a restored session racing the
+    /// one that's playing) share one round of providers instead of each fanning out.
+    in_flight: tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::watch::Receiver<Option<FetchResult>>>>>,
     /// Apple's web-player token, scraped once per session for PaxSenix's Apple
     /// lyrics (cleared when it stops working, so the next song tries again).
     apple_jwt: tokio::sync::Mutex<Option<String>>,
 }
+
+/// What a shared fetch came back with, handed to the asks that waited on it.
+type FetchResult = Result<std::sync::Arc<LyricsSet>, String>;
 
 const CHALLENGE_RETRY: Duration = Duration::from_secs(15 * 60);
 const RECENT: usize = 8;
@@ -282,16 +289,60 @@ impl Client {
             jwt: tokio::sync::Mutex::new(cached),
             challenge_failed: Default::default(),
             recent: Default::default(),
+            in_flight: Default::default(),
             apple_jwt: tokio::sync::Mutex::new(None),
         }
     }
 
+    /// The cached set for a song, if it's still around.
+    pub fn cached_for(&self, video_id: &str) -> Option<std::sync::Arc<LyricsSet>> {
+        self.recent.lock().unwrap().iter().find(|(id, _)| id == video_id).map(|(_, set)| std::sync::Arc::clone(set))
+    }
+
     /// Every source's lyrics for a song: the Better Lyrics stream, Unison, lrc.red,
-    /// and the app's own providers (PaxSenix, LyricsPlus, Genius), together.
-    pub async fn fetch(&self, q: &Query<'_>) -> anyhow::Result<LyricsSet> {
-        if let Some((_, l)) = self.recent.lock().unwrap().iter().find(|(id, _)| id == q.video_id) {
-            return Ok(l.clone());
+    /// and the app's own providers (PaxSenix, LyricsPlus, Genius), together. Two asks
+    /// for the same song share one round.
+    pub async fn fetch(&self, q: &Query<'_>) -> anyhow::Result<std::sync::Arc<LyricsSet>> {
+        if let Some(set) = self.cached_for(q.video_id) {
+            return Ok(set);
         }
+        let mut in_flight = self.in_flight.lock().await;
+        if let Some(set) = self.cached_for(q.video_id) {
+            return Ok(set);
+        }
+        if let Some(waiting) = in_flight.get(q.video_id).cloned() {
+            drop(in_flight);
+            let mut rx = (*waiting).clone();
+            return match rx.wait_for(|v| v.is_some()).await {
+                Ok(answer) => match answer.clone() {
+                    Some(Ok(set)) => Ok(set),
+                    Some(Err(e)) => Err(anyhow::anyhow!(e)),
+                    None => unreachable!("wait_for only returns when the predicate holds"),
+                },
+                // The ask that was fetching died without an answer (a panic is the only
+                // way out without one); this one doesn't follow it.
+                Err(_) => Err(anyhow::anyhow!("the lyrics fetch was abandoned")),
+            };
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        in_flight.insert(q.video_id.to_owned(), std::sync::Arc::new(rx));
+        drop(in_flight);
+        let res = self.fetch_all(q).await;
+        self.in_flight.lock().await.remove(q.video_id);
+        match res {
+            Ok(set) => {
+                tx.send_replace(Some(Ok(set.clone())));
+                Ok(set)
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tx.send_replace(Some(Err(msg.clone())));
+                Err(anyhow::anyhow!(msg))
+            }
+        }
+    }
+
+    async fn fetch_all(&self, q: &Query<'_>) -> anyhow::Result<std::sync::Arc<LyricsSet>> {
         let (stream, unison, lrcred, paxsenix, lyricsplus, genius) = tokio::join!(
             self.fetch_stream(q),
             self.fetch_unison(q),
@@ -317,10 +368,10 @@ impl Client {
         sources.extend(lyricsplus);
         sources.extend(genius);
         if sources.is_empty() {
-            return Ok(LyricsSet::default());
+            return Ok(std::sync::Arc::new(LyricsSet::default()));
         }
         sources.sort_by_key(|l| Provider::ALL.iter().position(|p| *p == l.provider));
-        let set = LyricsSet { sources };
+        let set = std::sync::Arc::new(LyricsSet { sources });
         let mut recent = self.recent.lock().unwrap();
         if recent.len() == RECENT {
             recent.pop_front();
@@ -708,20 +759,12 @@ impl Client {
         Ok(vec![])
     }
 
-    /// Songs fetched lately that came back since `fetch` cached them (YouTube's own
-    /// sources arrive after): fold them into the cached set too, so replays keep them.
-    pub fn merge_cached(&self, video_id: &str, extra: Vec<Lyrics>) {
-        if extra.is_empty() {
-            return;
-        }
+    /// A set that grew sources after `fetch` cached it (YouTube's own arrive after):
+    /// swap it in, so replays keep them.
+    pub fn replace_cached(&self, video_id: &str, set: std::sync::Arc<LyricsSet>) {
         let mut recent = self.recent.lock().unwrap();
-        if let Some((_, set)) = recent.iter_mut().find(|(id, _)| id == video_id) {
-            for l in extra {
-                if !set.sources.iter().any(|s| s.provider == l.provider) {
-                    set.sources.push(l);
-                }
-            }
-            set.sources.sort_by_key(|l| Provider::ALL.iter().position(|p| *p == l.provider));
+        if let Some(slot) = recent.iter_mut().find(|(id, _)| id == video_id) {
+            slot.1 = set;
         }
     }
 }

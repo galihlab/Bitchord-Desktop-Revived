@@ -42,18 +42,48 @@ pub struct Art {
 
 pub fn process(bytes: &[u8]) -> anyhow::Result<Art> {
     let img = image::load_from_memory(bytes)?.to_rgb8();
+    Ok(process_rgb(&img))
+}
+
+/// The still-cover pipeline over a decoded image: the sleeve's square crop, resized to
+/// SIZE×SIZE, then [`process_small`].
+fn process_rgb(img: &image::RgbImage) -> Art {
     // The sleeve shows the thumbnail's square crop (`Thumb::square_uv`); a raw one is
     // letterboxed 4:3 for many videos, and the backdrop's bars would tint toward the
     // accent as bands of colour nothing else shows. Crop first, like the sleeve does.
     let img = match crate::model::square_crop_px(img.width(), img.height()) {
-        Some((x, y, side)) => image::imageops::crop_imm(&img, x, y, side, side).to_image(),
-        None => img,
+        Some((x, y, side)) => image::imageops::crop_imm(img, x, y, side, side).to_image(),
+        None => img.clone(),
     };
-    let small = image::imageops::resize(&img, SIZE, SIZE, image::imageops::FilterType::Triangle);
+    process_small(&image::imageops::resize(&img, SIZE, SIZE, image::imageops::FilterType::Triangle))
+}
 
-    let look = analyse(&small);
-    let mut px: Vec<[f32; 3]> = small.pixels().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
+/// The accent, tint and blur of a cover already SIZE×SIZE.
+fn process_small(small: &image::RgbImage) -> Art {
+    let look = analyse(small);
+    let px: Vec<[f32; 3]> = small.pixels().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
+    backdrop(px, &look)
+}
 
+/// A frame of an animated cover as the cover art, as a still cover's would be (accent,
+/// tint and blur), sampled nearest-neighbour so it stays cheap.
+pub fn from_cover_frame(frame: &egui::ColorImage) -> Option<Art> {
+    let ([w, h], n) = (frame.size, SIZE as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    // Motion sleeves centre-crop both landscape and portrait frames (paint_motion).
+    let side = w.min(h);
+    let (left, top) = ((w - side) / 2, (h - side) / 2);
+    let small = image::RgbImage::from_fn(SIZE, SIZE, |x, y| {
+        let c = frame.pixels[(top + y as usize * side / n) * w + left + x as usize * side / n];
+        image::Rgb([c.r(), c.g(), c.b()])
+    });
+    Some(process_small(&small))
+}
+
+/// The backdrop from SIZE×SIZE pixels (0–255): tinted toward the accent, then blurred.
+fn backdrop(mut px: Vec<[f32; 3]>, look: &Look) -> Art {
     // Kawarp's tint pass: pull near-black regions toward the accent so dark covers
     // still produce a coloured backdrop instead of a black one. Two guards keep the
     // wash honest to the sleeve: it scales with how much colour the cover carries
@@ -79,7 +109,7 @@ pub fn process(bytes: &[u8]) -> anyhow::Result<Art> {
         px = box_blur(&px, SIZE as usize, 6);
     }
     let rgba = px.iter().flat_map(|p| [p[0] as u8, p[1] as u8, p[2] as u8, 255]).collect();
-    Ok(Art { rgba, accent: look.accent })
+    Art { rgba, accent: look.accent }
 }
 
 pub(crate) fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
@@ -233,6 +263,33 @@ pub fn idle() -> Art {
 mod tests {
     use super::*;
     use image::RgbImage;
+
+    #[test]
+    fn a_cover_frame_gives_a_still_covers_colours() {
+        // Flat colour: sampling it small can't tell nearest from Triangle.
+        let frame = egui::ColorImage::new([300, 300], vec![egui::Color32::from_rgb(180, 60, 120); 300 * 300]);
+        let still = process_rgb(&RgbImage::from_pixel(300, 300, image::Rgb([180, 60, 120])));
+        let art = from_cover_frame(&frame).unwrap();
+        assert_eq!((art.accent, art.rgba), (still.accent, still.rgba));
+        assert!(from_cover_frame(&egui::ColorImage::new([0, 0], vec![])).is_none());
+    }
+
+    #[test]
+    fn motion_colours_ignore_the_cropped_edges() {
+        let square = egui::ColorImage::new([128, 128], vec![Color32::from_rgb(40, 90, 180); 128 * 128]);
+        let expected = from_cover_frame(&square).unwrap();
+        for (w, h) in [(192, 128), (128, 192)] {
+            let mut frame = egui::ColorImage::new([w, h], vec![Color32::from_rgb(240, 60, 30); w * h]);
+            let (left, top) = ((w - 128) / 2, (h - 128) / 2);
+            for y in 0..128 {
+                for x in 0..128 {
+                    frame.pixels[(top + y) * w + left + x] = square.pixels[y * 128 + x];
+                }
+            }
+            let art = from_cover_frame(&frame).unwrap();
+            assert_eq!((art.accent, &art.rgba), (expected.accent, &expected.rgba));
+        }
+    }
 
     /// A solid `base` square with a `block` block in the middle, the shape of a
     /// sleeve with one designed element on it.

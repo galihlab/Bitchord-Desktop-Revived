@@ -26,7 +26,6 @@ pub struct Frame {
 }
 
 pub struct Motion {
-    url: String,
     latest: Mutex<Option<Arc<Frame>>>,
     version: AtomicU64,
     stop: Arc<AtomicBool>,
@@ -35,18 +34,14 @@ pub struct Motion {
 }
 
 impl Motion {
-    fn new(url: &str) -> Self {
-        Self { url: url.to_owned(), latest: Mutex::new(None), version: AtomicU64::new(0), stop: Arc::new(AtomicBool::new(false)), playing: Arc::new(AtomicBool::new(true)) }
+    fn new() -> Self {
+        Self { latest: Mutex::new(None), version: AtomicU64::new(0), stop: Arc::new(AtomicBool::new(false)), playing: Arc::new(AtomicBool::new(true)) }
     }
 
     /// The newest frame, with the counter that says it changed.
     pub fn latest(&self) -> Option<(u64, Arc<Frame>)> {
         let frame = self.latest.lock().ok()?.clone()?;
         Some((self.version.load(Ordering::Acquire), frame))
-    }
-
-    pub fn url(&self) -> &str {
-        &self.url
     }
 
     /// Stop decoding: the page that showed this clip is gone.
@@ -76,36 +71,65 @@ impl Drop for Motion {
 
 static STREAMS: LazyLock<Mutex<HashMap<String, Weak<Motion>>>> = LazyLock::new(Default::default);
 
+/// Clips the disk cache keeps, dropping the oldest first; a dropped one re-downloads
+/// when its sleeve shows again.
+const DISK_BUDGET: u64 = 128 * 1024 * 1024;
+
+/// Keep the clip cache under its budget, dropping the least recently written files.
+fn trim(dir: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<_> = rd
+        .flatten()
+        .filter_map(|f| {
+            let m = f.metadata().ok()?;
+            Some((m.modified().ok()?, m.len(), f.path()))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    files.sort();
+    for (_, len, path) in files {
+        if total <= DISK_BUDGET {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+        }
+    }
+}
+
 /// Start (or reuse) the clip at `master`, decoded no wider than `max_width`.
 pub fn play(ctx: &egui::Context, master: &str, max_width: u32) -> Arc<Motion> {
     let key = format!("{max_width}:{master}");
     if let Ok(mut streams) = STREAMS.lock() {
+        // Views come and go; without this their keys' dead Weaks pile up for the session.
+        streams.retain(|_, w| w.strong_count() > 0);
         if let Some(m) = streams.get(&key).and_then(Weak::upgrade) {
             return m;
         }
-        let motion = Arc::new(Motion::new(master));
+        let motion = Arc::new(Motion::new());
         streams.insert(key, Arc::downgrade(&motion));
         let (this, ctx, url) = (motion.clone(), ctx.clone(), master.to_owned());
         let _ = std::thread::Builder::new().name("motion".into()).spawn(move || run(this, ctx, url, max_width));
         return motion;
     }
-    Arc::new(Motion::new(master))
+    Arc::new(Motion::new())
 }
 
 /// Start (or reuse) a clip that is one plain mp4 (Spotify's canvas), not Apple's HLS.
 pub fn play_mp4(ctx: &egui::Context, url: &str, max_width: u32) -> Arc<Motion> {
     let key = format!("mp4:{max_width}:{url}");
     if let Ok(mut streams) = STREAMS.lock() {
+        streams.retain(|_, w| w.strong_count() > 0);
         if let Some(m) = streams.get(&key).and_then(Weak::upgrade) {
             return m;
         }
-        let motion = Arc::new(Motion::new(url));
+        let motion = Arc::new(Motion::new());
         streams.insert(key, Arc::downgrade(&motion));
         let (this, ctx, url) = (motion.clone(), ctx.clone(), url.to_owned());
         let _ = std::thread::Builder::new().name("motion".into()).spawn(move || run_mp4(this, ctx, url, max_width));
         return motion;
     }
-    Arc::new(Motion::new(url))
+    Arc::new(Motion::new())
 }
 
 fn run(motion: Arc<Motion>, ctx: egui::Context, master: String, max_width: u32) {
@@ -124,36 +148,45 @@ fn run_mp4(motion: Arc<Motion>, ctx: egui::Context, url: String, max_width: u32)
     decode(&motion, &path, &ctx, max_width);
 }
 
-/// Save a plain mp4 to the cache; a saved copy is reused.
 fn fetch_mp4(url: &str) -> Option<PathBuf> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
-    rt.block_on(async {
-        use sha1::{Digest, Sha1};
-        let dir = crate::data_dir().join("motion");
-        std::fs::create_dir_all(&dir).ok()?;
-        let name = format!("{:x}", Sha1::digest(url.as_bytes()));
-        let path = dir.join(format!("{}.mp4", &name[..32]));
-        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 1024 {
-            return Some(path);
-        }
-        let bytes = crate::proxy::http()
-            .get(url)
-            .timeout(Duration::from_secs(30))
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
-            .send()
-            .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .bytes()
-            .await
-            .ok()?;
-        let tmp = path.with_extension("part");
-        std::fs::write(&tmp, &bytes).ok()?;
-        std::fs::rename(&tmp, &path).ok()?;
-        log::info!("canvas: clip {:.0} KB cached", bytes.len() as f64 / 1024.0);
-        Some(path)
-    })
+    rt.block_on(cache_mp4(&crate::proxy::http(), &crate::data_dir(), url, usize::MAX)).ok()
+}
+
+/// Share the source clip between the canvas player and the Discord GIF encoder.
+pub(crate) async fn cache_mp4(http: &reqwest::Client, data_dir: &std::path::Path, url: &str, limit: usize) -> anyhow::Result<PathBuf> {
+    use sha1::{Digest, Sha1};
+    static DOWNLOAD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _download = DOWNLOAD.lock().await;
+    let dir = data_dir.join("motion");
+    std::fs::create_dir_all(&dir)?;
+    let name = format!("{:x}", Sha1::digest(url.as_bytes()));
+    let path = dir.join(format!("{}.mp4", &name[..32]));
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > 1024
+    {
+        anyhow::ensure!(meta.len() <= limit as u64, "canvas clip is too large");
+        return Ok(path);
+    }
+    let mut reply = http
+        .get(url)
+        .timeout(Duration::from_secs(30))
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = reply.chunk().await? {
+        anyhow::ensure!(chunk.len() <= limit.saturating_sub(bytes.len()), "canvas clip is too large");
+        bytes.extend_from_slice(&chunk);
+    }
+    let tmp = path.with_extension("part");
+    let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path));
+    let _ = std::fs::remove_file(&tmp);
+    written?;
+    trim(&dir);
+    log::info!("canvas: clip {:.0} KB cached", bytes.len() as f64 / 1024.0);
+    Ok(path)
 }
 
 /// Pick a rendition and save the clip to the cache; a saved copy is reused. The
@@ -182,6 +215,7 @@ fn fetch(master: &str, max_width: u32) -> Option<PathBuf> {
         let tmp = path.with_extension("part");
         std::fs::write(&tmp, &bytes).ok()?;
         std::fs::rename(&tmp, &path).ok()?;
+        trim(&dir);
         log::info!("animated cover: clip {:.0} KB cached", bytes.len() as f64 / 1024.0);
         Some(path)
     })
@@ -231,10 +265,18 @@ struct Mp4Track {
     colors: crate::video::Colors,
 }
 
+fn h264_track(moov: &[u8]) -> Option<&[u8]> {
+    boxes(moov)
+        .filter(|(kind, _)| *kind == b"trak")
+        .map(|(_, b)| b)
+        .find(|b| find(b, &["mdia", "minf", "stbl", "stsd"]).is_some_and(|s| s.windows(4).any(|w| w == b"avcC")))
+}
+
 fn parse_track(moov: &[u8]) -> Option<Mp4Track> {
-    let mdhd = find(moov, &["trak", "mdia", "mdhd"])?;
-    let timescale = if mdhd[0] == 1 { be32(mdhd, 20)? } else { be32(mdhd, 12)? };
-    let stsd = find(moov, &["trak", "mdia", "minf", "stbl", "stsd"])?;
+    let video = h264_track(moov)?;
+    let mdhd = find(video, &["mdia", "mdhd"])?;
+    let timescale = if *mdhd.first()? == 1 { be32(mdhd, 20)? } else { be32(mdhd, 12)? };
+    let stsd = find(video, &["mdia", "minf", "stbl", "stsd"])?;
     let at = stsd.windows(4).position(|w| w == b"avcC")? + 4;
     let c = stsd.get(at..)?;
     let nal_len = (*c.get(4)? & 3) as usize + 1;
@@ -257,7 +299,10 @@ fn parse_track(moov: &[u8]) -> Option<Mp4Track> {
     copy(pps, &mut o)?;
     let default_duration = find(moov, &["mvex", "trex"]).and_then(|t| be32(t, 12)).unwrap_or(0);
     // With B-frames the first frame shows late; the edit list takes that back out.
-    let start = find(moov, &["trak", "edts", "elst"]).and_then(|e| if e[0] == 1 { be64(e, 16).map(|v| v as i64) } else { be32(e, 12).map(|v| v as i32 as i64) }).filter(|v| *v > 0).unwrap_or(0);
+    let start = find(video, &["edts", "elst"])
+        .and_then(|e| if *e.first()? == 1 { be64(e, 16).map(|v| v as i64) } else { be32(e, 12).map(|v| v as i32 as i64) })
+        .filter(|v| *v > 0)
+        .unwrap_or(0);
     Some(Mp4Track { params, nal_len, timescale, default_duration, start, colors })
 }
 
@@ -305,7 +350,7 @@ fn parse_moof(moof: &[u8], moof_at: usize, track: &Mp4Track, out: &mut Vec<Sampl
     };
     let default_size = if flags & 0x10 != 0 { be32(tfhd, o)? } else { 0 };
     let tfdt = find(traf, &["tfdt"])?;
-    let mut time = if tfdt[0] == 1 { be64(tfdt, 4)? as i64 } else { be32(tfdt, 4)? as i64 };
+    let mut time = if *tfdt.first()? == 1 { be64(tfdt, 4)? as i64 } else { be32(tfdt, 4)? as i64 };
     let scale = track.timescale.max(1) as f64;
     // Counted from the start of the `moof`, as Apple's files say to.
     let mut at = moof_at;
@@ -314,6 +359,9 @@ fn parse_moof(moof: &[u8], moof_at: usize, track: &Mp4Track, out: &mut Vec<Sampl
     for trun in boxes(traf).filter(|(kind, _)| *kind == b"trun").map(|(_, body)| body) {
         let flags = be32(trun, 0)? & 0xff_ffff;
         let count = be32(trun, 4)? as usize;
+        if count > 8_000usize.saturating_sub(out.len()) {
+            return None;
+        }
         let mut o = 8;
         if flags & 0x1 != 0 {
             at = (moof_at as i64 + be32(trun, o)? as i32 as i64) as usize;
@@ -350,6 +398,114 @@ fn parse_moof(moof: &[u8], moof_at: usize, track: &Mp4Track, out: &mut Vec<Sampl
         }
     }
     Some(())
+}
+
+/// A non-fragmented MP4 (Spotify usually serves these) indexes samples by chunk.
+fn flat_samples(moov: &[u8], track: &Mp4Track) -> Option<Vec<Sample>> {
+    let tables = find(h264_track(moov)?, &["mdia", "minf", "stbl"])?;
+    let sizes = find(tables, &["stsz"])?;
+    let count = be32(sizes, 8)? as usize;
+    if count > 8000 {
+        return None;
+    }
+    let fixed = be32(sizes, 4)? as usize;
+    let durations = sample_runs(find(tables, &["stts"])?, count)?;
+    let offsets = find(tables, &["ctts"]).and_then(|b| sample_runs(b, count));
+    let chunks = find(tables, &["stsc"])?;
+    let (offsets_box, width) = find(tables, &["stco"]).map(|b| (b, 4)).or_else(|| find(tables, &["co64"]).map(|b| (b, 8)))?;
+    let chunk_count = be32(offsets_box, 4)? as usize;
+    if chunk_count > count || 8 + chunk_count * width > offsets_box.len() {
+        return None;
+    }
+    let mut rule = 8;
+    let mut time = 0i64;
+    let mut samples = Vec::with_capacity(count);
+    for chunk in 1..=chunk_count {
+        if be32(chunks, rule + 12) == Some(chunk as u32) {
+            rule += 12;
+        }
+        let per_chunk = be32(chunks, rule + 4)? as usize;
+        let start = 8 + (chunk - 1) * width;
+        let mut at = if width == 4 { be32(offsets_box, start)? as usize } else { usize::try_from(be64(offsets_box, start)?).ok()? };
+        for _ in 0..per_chunk {
+            let i = samples.len();
+            let size = if fixed == 0 { be32(sizes, 12 + i * 4)? as usize } else { fixed };
+            let offset = offsets.as_ref().and_then(|o| o.get(i)).copied().unwrap_or_default();
+            let pts = (time + i64::from(offset) - track.start) as f64 / f64::from(track.timescale.max(1));
+            samples.push(Sample { at, size, pts });
+            at = at.checked_add(size)?;
+            time += i64::from(*durations.get(i)?);
+        }
+    }
+    (samples.len() == count).then_some(samples)
+}
+
+fn sample_runs(table: &[u8], count: usize) -> Option<Vec<i32>> {
+    let mut values = Vec::with_capacity(count);
+    let entries = be32(table, 4)? as usize;
+    for pair in table.get(8..)?.as_chunks::<8>().0.iter().take(entries) {
+        let run = be32(pair, 0)? as usize;
+        let value = be32(pair, 4)? as i32;
+        let end = values.len().checked_add(run)?;
+        if end > count {
+            return None;
+        }
+        values.resize(end, value);
+    }
+    (values.len() == count).then_some(values)
+}
+
+fn clip_samples(bytes: &[u8], moov: &[u8], track: &Mp4Track) -> Vec<Sample> {
+    let fragments = parse_fragment(bytes, track);
+    if fragments.is_empty() { flat_samples(moov, track).unwrap_or_default() } else { fragments }
+}
+
+/// Decode a single lap, selecting only the frames a bounded Discord GIF will keep.
+pub(crate) fn visit_clip(bytes: &[u8], side: u32, fps: u8, mut frame: impl FnMut(usize, usize, Vec<u8>, u32) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    let moov = find(bytes, &["moov"]).context("clip has no MP4 header")?;
+    let track = parse_track(moov).context("clip isn't H.264")?;
+    let samples = clip_samples(bytes, moov, &track);
+    ensure!((2..=8000).contains(&samples.len()), "clip has an unsupported frame count");
+    let (times, length) = loop_times(&samples.iter().map(|s| s.pts).collect::<Vec<_>>());
+    ensure!((0.04..=60.0).contains(&length), "clip has an unsupported duration");
+    let length_cs = (length * 100.0).round() as u32;
+    let interval = (100.0 / f64::from(fps)).max(f64::from(length_cs) / 359.0);
+    let mut decoder = new_decoder(&track)?;
+    let mut pending = std::collections::BinaryHeap::new();
+    let mut previous = None;
+    let mut next = 0.0;
+    let mut selected = 0;
+    let mut take = |yuv: &openh264::decoder::DecodedYUV, Pts(t): Pts| -> anyhow::Result<()> {
+        let at = (t * 100.0).round() as u32;
+        if (t * 100.0 + 0.5 < next && selected != 0) || at + 2 > length_cs || selected >= 360 {
+            return Ok(());
+        }
+        let (w, h) = yuv.dimensions();
+        ensure!(w <= 4096 && h <= 4096, "clip frame is too large");
+        let (w, h, rgba) = scaled_rgba(yuv, (w.min(h) / side as usize).max(1), track.colors);
+        if let Some((before, w, h, rgba)) = previous.replace((at, w, h, rgba)) {
+            frame(w, h, rgba, (at - before) * 10)?;
+        }
+        selected += 1;
+        next = (f64::from(selected) * interval).max(f64::from(at + 2));
+        Ok(())
+    };
+    for (sample, t) in samples.into_iter().zip(times) {
+        let raw = bytes.get(sample.at..sample.at.checked_add(sample.size).context("invalid sample size")?).context("invalid sample offset")?;
+        pending.push(Pts(t));
+        if let Some(yuv) = decoder.decode(&annex_b(raw, track.nal_len))? {
+            take(&yuv, pending.pop().context("missing sample time")?)?;
+        }
+    }
+    for yuv in decoder.flush_remaining()?.iter() {
+        take(yuv, pending.pop().context("missing sample time")?)?;
+    }
+    ensure!(selected >= 2, "clip has no animation");
+    if let Some((at, w, h, rgba)) = previous {
+        frame(w, h, rgba, (length_cs - at) * 10)?;
+    }
+    Ok(())
 }
 
 /// A sample's length-prefixed NAL units with start codes, as the decoder takes them.
@@ -618,7 +774,7 @@ mod tests {
             .find(|p| p.extension().is_some_and(|e| e == "mp4"))
             .expect("no cached clip");
         let ctx = egui::Context::default();
-        let motion = Arc::new(Motion::new("test"));
+        let motion = Arc::new(Motion::new());
         let this = motion.clone();
         std::thread::spawn(move || decode(&this, &path, &ctx, 400));
         let start = Instant::now();
